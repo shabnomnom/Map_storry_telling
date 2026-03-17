@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Carte — AI Map Storyteller</title>
+
+  <!-- Mapbox GL JS -->
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+
+  <link rel="stylesheet" href="carte.css" />
+</head>
+<body>
+
+<div id="lightbox">
+  <button id="lightbox-close" title="Close">✕</button>
+  <img id="lightbox-img" src="" alt="Photo" />
+</div>
+
+<div id="map"></div>
+
+<div id="fly-label"></div>
+
+<div id="panel">
+  <div id="panel-header">
+    <h1>Car<em>te</em></h1>
+    <p>AI-powered map storytelling</p>
+  </div>
+
+  <div id="log">
+    <div class="msg system">
+      <div class="msg-bubble" id="welcome-msg"></div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="input-row">
+      <input id="location-input" type="text" placeholder="Tokyo, Japan" autocomplete="off" />
+      <button id="send-btn">Take me there →</button>
+    </div>
+    <div id="hint">powered by Claude + Mapbox</div>
+    <button id="custom-toggle-btn">+ custom transport</button>
+    <div id="custom-transport">
+      <span>got there by</span>
+      <input id="custom-emoji-input" type="text" maxlength="2" placeholder="🚲" title="Paste any emoji" />
+      <input id="custom-label-input" type="text" maxlength="32" placeholder="e.g. bike, ferry, horse…" />
+      <button id="custom-set-btn">set</button>
+    </div>
+    <div id="replay-bar">
+      <button id="replay-btn">▶ replay trip</button>
+      <button id="stop-btn">■ stop</button>
+    </div>
+  </div>
+</div>
+
+<!-- Replay progress HUD, sits over the map -->
+<div id="replay-hud">
+  <div>
+    <div class="hud-stop" id="hud-stop-label"></div>
+    <div class="hud-name"  id="hud-name-label"></div>
+    <div class="hud-transport" id="hud-transport-label"></div>
+  </div>
+  <div class="hud-dots" id="hud-dots"></div>
+  <button id="hud-next-btn">Next →</button>
+</div>
+
+<script>
+// ─────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────
+const MAPBOX_TOKEN    = '__MAPBOX_TOKEN__';
+const ANTHROPIC_PROXY = 'http://localhost:3000/api/claude'; // proxied via server.js
+
+/** Default starting coordinate (New York City) — declared first, used everywhere */
+const ORIGIN = [-74.006, 40.7128];
+
+// ─────────────────────────────────────────
+// MAPBOX INIT
+// ─────────────────────────────────────────
+mapboxgl.accessToken = MAPBOX_TOKEN;
+
+const map = new mapboxgl.Map({
+  container: 'map',
+  style: 'mapbox://styles/mapbox/outdoors-v12',
+  center: ORIGIN,
+  zoom: 10,
+  pitch: 40,
+  bearing: 0,
+  projection: 'globe',
+});
+
+map.on('load', () => {
+  map.setFog({
+    color: 'rgb(186, 210, 235)',
+    'high-color': 'rgb(36, 92, 223)',
+    'horizon-blend': 0.02,
+    'space-color': 'rgb(11, 11, 25)',
+    'star-intensity': 0.6
+  });
+
+  // ── TRAVEL PATH LINE ──────────────────────
+  map.addSource('route', {
+    type: 'geojson',
+    data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } }
+  });
+
+  map.addLayer({
+    id: 'route-line',
+    type: 'line',
+    source: 'route',
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: {
+      'line-color': '#7B3F00',
+      'line-width': 4,
+      'line-opacity': 1,
+    }
+  });
+
+  map.addLayer({
+    id: 'route-line-dash',
+    type: 'line',
+    source: 'route',
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: {
+      'line-color': '#ffffff',
+      'line-width': 2,
+      'line-opacity': 0.7,
+      'line-dasharray': [4, 6],
+    }
+  });
+});
+
+// ─────────────────────────────────────────
+// APP STATE
+// ─────────────────────────────────────────
+
+let currentMarker = null;
+// Travel path coordinates (starts at NYC)
+const routeCoords = [ORIGIN.slice()];
+// Ordered log of every visited stop (for replay).
+// Each entry: { coords, display_name, description, zoom, fan,
+//               transport, transportDef, lineColor }
+const tripLog = [];
+
+// Transport state — selected before each new destination
+const TRANSPORT = {
+  plane:  { emoji: '✈️', label: 'by plane', lineColor: '#7B3F00' },
+  train:  { emoji: '🚂', label: 'by train', lineColor: '#1a6faf' },
+  car:    { emoji: '🚗', label: 'by car',   lineColor: '#2e7d32' },
+  custom: { emoji: '🚲', label: 'by bike',  lineColor: '#6a3d9a' }, // overwritten at runtime
+};
+let currentTransport = null; // null = not yet picked for this leg
+
+// ─────────────────────────────────────────
+// SHARED UTILITIES
+// ─────────────────────────────────────────
+
+/** Ease-in-out cubic — matches Mapbox flyTo easing */
+const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+
+/** Linear interpolation */
+const lerp = (a, b, t) => a + (b - a) * t;
+
+/**
+ * Shared flyTo options factory.
+ * @param {[number,number]} center
+ * @param {number} zoom
+ * @param {number} duration
+ */
+function makeFlyOptions(center, zoom, duration) {
+  return {
+    center,
+    zoom,
+    pitch:    zoom > 10 ? 55 : 35,
+    bearing:  Math.random() * 40 - 20,
+    duration,
+    essential: true,
+    curve:    1.6,
+    easing:   easeInOutCubic,
+  };
+}
+
+// ─────────────────────────────────────────
+// DOM REFS  — all getElementById calls in one place
+// ─────────────────────────────────────────
+
+// Lightbox
+const lightbox         = document.getElementById('lightbox');
+const lightboxImg      = document.getElementById('lightbox-img');
+const lightboxCloseBtn = document.getElementById('lightbox-close');
+
+// Chat panel
+const log        = document.getElementById('log');
+const welcomeMsg = document.getElementById('welcome-msg');
+const sendBtn    = document.getElementById('send-btn');
+const inputEl    = document.getElementById('location-input');
+const flyLabel   = document.getElementById('fly-label');
+const replayBar  = document.getElementById('replay-bar');
+
+// Custom transport UI
+const customToggleBtn  = document.getElementById('custom-toggle-btn');
+const customTransport  = document.getElementById('custom-transport');
+const customEmojiInput = document.getElementById('custom-emoji-input');
+const customLabelInput = document.getElementById('custom-label-input');
+const customSetBtn     = document.getElementById('custom-set-btn');
+
+// Replay HUD
+const hudEl        = document.getElementById('replay-hud');
+const hudStopLabel = document.getElementById('hud-stop-label');
+const hudNameLabel = document.getElementById('hud-name-label');
+const hudTransport = document.getElementById('hud-transport-label');
+const hudDotsEl    = document.getElementById('hud-dots');
+const hudNextBtn   = document.getElementById('hud-next-btn');
+const replayBtn    = document.getElementById('replay-btn');
+const stopBtn      = document.getElementById('stop-btn');
+
+// ─────────────────────────────────────────
+// LIGHTBOX
+// ─────────────────────────────────────────
+
+function openLightbox(src) {
+  lightboxImg.src = src;
+  lightbox.classList.add('open');
+}
+function closeLightbox() {
+  lightbox.classList.remove('open');
+  setTimeout(() => { lightboxImg.src = ''; }, 250);
+}
+
+// ─────────────────────────────────────────
+// MAP PHOTO FAN  — photos fanning out at a map marker
+// ─────────────────────────────────────────
+class MapPhotoFan {
+  /**
+   * @param {[number,number]} lngLat  — [lng, lat]
+   * @param {mapboxgl.Map}    map
+   */
+  constructor(lngLat, map) {
+    this.lngLat  = lngLat;
+    this.map     = map;
+    this.photos  = [];   // { dataUrl, wrap, img } objects
+
+    // Root wrapper — a Mapbox Marker with a 0×0 custom element
+    this._root = document.createElement('div');
+    this._root.className = 'map-photo-fan-wrap';
+
+    // Amber dot
+    this._dot = document.createElement('div');
+    this._dot.className = 'map-marker-dot';
+    this._root.appendChild(this._dot);
+
+    // "+" button
+    this._addBtn = document.createElement('button');
+    this._addBtn.className = 'map-add-photo-btn';
+    this._addBtn.title = 'Add photos to this location';
+    this._addBtn.textContent = '+';
+    this._root.appendChild(this._addBtn);
+
+    // Hidden file input
+    this._fileInput = document.createElement('input');
+    this._fileInput.type = 'file';
+    this._fileInput.accept = 'image/*';
+    this._fileInput.multiple = true;
+    this._fileInput.style.display = 'none';
+    document.body.appendChild(this._fileInput);
+
+    this._addBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      this._fileInput.click();
+    });
+    this._fileInput.addEventListener('change', () => this._handleFiles());
+
+    // Mapbox marker (anchor = centre of the 0×0 element = the dot's top-left baseline)
+    this._marker = new mapboxgl.Marker({ element: this._root, anchor: 'center' })
+      .setLngLat(lngLat)
+      .addTo(map);
+  }
+
+  _handleFiles() {
+    const remaining = 5 - this.photos.length;
+    const files = Array.from(this._fileInput.files).slice(0, remaining);
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = e => this._addPhoto(e.target.result);
+      reader.readAsDataURL(file);
+    });
+    this._fileInput.value = '';
+    if (this.photos.length >= 5) this._addBtn.style.display = 'none';
+  }
+
+  _addPhoto(dataUrl) {
+    if (this.photos.length >= 5) return;
+    const idx = this.photos.length;
+
+    // wrapper (needed for the ✕ badge)
+    const wrap = document.createElement('div');
+    wrap.className = 'map-fan-img-wrap';
+    wrap.style.zIndex = idx + 4;
+
+    const img = document.createElement('img');
+    img.className = 'map-fan-img';
+    img.src = dataUrl;
+    img.draggable = false;
+    img.title = 'Click to enlarge';
+    img.addEventListener('click', e => {
+      e.stopPropagation();
+      openLightbox(dataUrl);
+    });
+
+    const badge = document.createElement('div');
+    badge.className = 'remove-badge';
+    badge.textContent = '✕';
+    badge.title = 'Remove photo';
+    badge.addEventListener('click', e => {
+      e.stopPropagation();
+      const i = this.photos.findIndex(p => p.wrap === wrap);
+      if (i === -1) return;
+      wrap.remove();
+      this.photos.splice(i, 1);
+      this._relayout();
+      if (this.photos.length < 5) this._addBtn.style.display = '';
+    });
+
+    wrap.appendChild(img);
+    wrap.appendChild(badge);
+    this._root.appendChild(wrap);
+
+    this.photos.push({ dataUrl, wrap, img });
+    this._relayout();
+    if (this.photos.length >= 5) this._addBtn.style.display = 'none';
+  }
+
+  // Recompute positions/rotations for every photo in the fan
+  _relayout() {
+    const n = this.photos.length;
+    if (n === 0) return;
+
+    // Spread arc: widens as more photos are added (max 80° total)
+    const spreadDeg = Math.min(40 * (n - 1), 80);
+    const imgW = 72, imgH = 84;
+    const radius = 72; // px from the dot centre to the bottom-centre of each photo
+
+    this.photos.forEach(({ wrap }, i) => {
+      // -90° = straight up; spread evenly around that axis
+      const baseDeg = -90;
+      const angleDeg = n === 1
+        ? baseDeg
+        : baseDeg - spreadDeg / 2 + (spreadDeg / (n - 1)) * i;
+      const angleRad = (angleDeg * Math.PI) / 180;
+
+      // Centre of photo bottom sits at this offset from the dot
+      const bx = radius * Math.cos(angleRad);
+      const by = radius * Math.sin(angleRad);
+
+      // Card tilt mirrors the fan angle (0° = upright when pointing straight up)
+      const tiltDeg = angleDeg + 90;
+
+      // Top-left of the wrap relative to the 0×0 origin (dot centre)
+      const tx = bx - imgW / 2;
+      const ty = by - imgH;
+
+      // Wrap handles position + rotation; img handles hover scale via CSS
+      wrap.style.transform  = `translate(${tx}px, ${ty}px) rotate(${tiltDeg}deg)`;
+      wrap.style.zIndex     = i + 4;
+
+      // Pivot scale from the card's bottom-centre (attachment point to the fan)
+      const img = wrap.querySelector('img');
+      img.style.transformOrigin = `${imgW / 2}px ${imgH}px`;
+      img.style.transform = ''; // clear any leftover inline transform
+    });
+  }
+
+  hide()   { this._root.style.display = 'none'; }
+  show()   { this._root.style.display = ''; }
+  remove() {
+    this._marker.remove();
+    this._fileInput.remove();
+  }
+}
+
+// ─────────────────────────────────────────
+// TOOL DEFINITIONS (sent to Claude)
+// ─────────────────────────────────────────
+const tools = [
+  {
+    name: "resolve_location",
+    description: "Resolves a place name or description into geographic coordinates (latitude/longitude), a clean display name, country, and a short evocative description. Always call this tool before flying to any location.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The location query to resolve, e.g. 'Kyoto, Japan' or 'the Eiffel Tower'" }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "set_transport",
+    description: "Records how the traveller got to the next location. Call this when the user mentions travelling by plane, train, car, or any other mode. Call it BEFORE fly_to_location. For unusual modes (bike, boat, ferry, horse, skateboard, etc.) use mode='custom' and supply the emoji and a short label.",
+    input_schema: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["plane", "train", "car", "custom"],
+          description: "The transport mode. Use 'custom' for anything not in the standard list."
+        },
+        emoji: {
+          type: "string",
+          description: "Required when mode is 'custom'. A single emoji representing the transport, e.g. '🚲' for bike, '⛵' for sailboat, '🛶' for canoe, '🐎' for horse."
+        },
+        custom_label: {
+          type: "string",
+          description: "Required when mode is 'custom'. Short label shown in the UI, e.g. 'by bike', 'by ferry', 'on horseback'."
+        }
+      },
+      required: ["mode"]
+    }
+  },
+  {
+    name: "fly_to_location",
+    description: "Flies the Mapbox map to the given coordinates with a cinematic animation. Call this AFTER resolve_location (and after set_transport if the user mentioned how they travelled).",
+    input_schema: {
+      type: "object",
+      properties: {
+        latitude:    { type: "number", description: "Latitude of the target location" },
+        longitude:   { type: "number", description: "Longitude of the target location" },
+        display_name:{ type: "string", description: "Human-readable name shown as map overlay" },
+        description: { type: "string", description: "Short evocative 1–2 sentence description of the place" },
+        zoom:        { type: "number", description: "Zoom level (1–18). Use ~4 for countries, ~10 for cities, ~14 for landmarks" }
+      },
+      required: ["latitude", "longitude", "display_name", "zoom"]
+    }
+  }
+];
+
+// ─────────────────────────────────────────
+// LOCAL TOOL EXECUTION
+// resolve_location → Mapbox Geocoding API
+// fly_to_location  → Mapbox GL JS + animation
+// set_transport    → updates route colour + transport state
+// ─────────────────────────────────────────
+
+// Minimal geocoder using Mapbox Geocoding API
+async function resolve_location({ query }) {
+  const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_TOKEN}&limit=1`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.features || data.features.length === 0) {
+      return { error: `Could not resolve location: "${query}"` };
+    }
+    const f = data.features[0];
+    const [lon, lat] = f.center;
+    return {
+      query,
+      latitude: lat,
+      longitude: lon,
+      display_name: f.place_name.split(',')[0].trim(),
+      full_name: f.place_name,
+      place_type: f.place_type?.[0] ?? 'place',
+    };
+  } catch (e) {
+    return { error: `Geocoding failed: ${e.message}` };
+  }
+}
+
+// ─────────────────────────────────────────
+// ANIMATION CORE  — RAF loop: route line + emoji marker
+// ─────────────────────────────────────────
+
+/**
+ * Drives BOTH the route line AND the transport emoji marker from the same
+ * requestAnimationFrame clock, so the emoji and the dashed line always arrive
+ * together.
+ *
+ * @param {string|null}       mode         - 'plane'|'train'|'car'|'custom'|null
+ * @param {[number,number]}   fromCoord
+ * @param {[number,number]}   toCoord
+ * @param {number}            duration     - ms
+ * @param {[number,number][]} baseCoords   - live route array; new point appended at t=1
+ * @param {Function}          [onDone]     - called once t reaches 1
+ * @param {object}            [transportDef] - frozen snapshot for replay; falls back to TRANSPORT[mode]
+ * @returns {Function} cancel — stops the loop and removes the marker
+ */
+function animateRouteAndMarker(mode, fromCoord, toCoord, duration, baseCoords, onDone, transportDef) {
+  // Resolve the transport definition once (replay snapshot takes priority)
+  const tDef = transportDef ?? (mode ? TRANSPORT[mode] : null) ?? null;
+
+  // ── bearing (degrees) from a to b, for plane rotation ───────────────────
+  function calcBearing(a, b) {
+    const R = Math.PI / 180;
+    const dLng = (b[0] - a[0]) * R;
+    const lat1 = a[1] * R, lat2 = b[1] * R;
+    const y = Math.sin(dLng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+    return (Math.atan2(y, x) / R + 360) % 360;
+  }
+
+  // ── emoji marker ─────────────────────────────────────────────────────────
+  let marker = null, markerEl = null;
+  // ✈️ points east naturally; subtract 90° so it faces the actual heading
+  const rotationDeg = (tDef && mode === 'plane') ? calcBearing(fromCoord, toCoord) - 90 : 0;
+
+  if (tDef) {
+    markerEl = document.createElement('div');
+    markerEl.className = 'transport-emoji-marker';
+    markerEl.textContent = tDef.emoji;
+    marker = new mapboxgl.Marker({ element: markerEl, anchor: 'center' })
+      .setLngLat(fromCoord)
+      .addTo(map);
+  }
+
+  // Cache the GeoJSON source once — avoids repeated map.getSource() calls per frame
+  const routeSource = map.getSource('route');
+
+  let cancelled = false;
+  let startTime = null;
+  let rafId     = null;
+
+  function frame(ts) {
+    if (cancelled) return;
+    if (startTime === null) startTime = ts;
+
+    const raw = Math.min((ts - startTime) / duration, 1);
+    const t   = easeInOutCubic(raw);
+    const lng = lerp(fromCoord[0], toCoord[0], t);
+    const lat = lerp(fromCoord[1], toCoord[1], t);
+
+    // Update route line
+    if (routeSource) {
+      routeSource.setData({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [...baseCoords, [lng, lat]] }
+      });
+    }
+
+    // Update emoji marker position (and bearing for plane)
+    if (marker) {
+      marker.setLngLat([lng, lat]);
+      if (mode === 'plane') {
+        markerEl.style.transform = `translate(-50%, -50%) rotate(${rotationDeg}deg)`;
+      }
+    }
+
+    if (raw < 1) {
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
+
+    // ── t === 1: commit final coord and clean up ──────────────────────────
+    if (routeSource) {
+      baseCoords.push(toCoord);
+      routeSource.setData({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: baseCoords }
+      });
+    }
+
+    // Fade out then remove emoji marker
+    if (marker) {
+      setTimeout(() => {
+        if (cancelled) return;
+        markerEl.style.transition = 'opacity 0.5s ease';
+        markerEl.style.opacity = '0';
+        setTimeout(() => { if (!cancelled) marker.remove(); }, 520);
+      }, 350);
+    }
+
+    onDone?.();
+  }
+
+  rafId = requestAnimationFrame(frame);
+
+  return () => {
+    cancelled = true;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (marker) marker.remove();
+  };
+}
+
+// ─────────────────────────────────────────
+// TOOL IMPLEMENTATIONS
+// ─────────────────────────────────────────
+
+function fly_to_location({ latitude, longitude, display_name, description, zoom }) {
+  // Snapshot the transport for THIS leg before anything resets it
+  const legTransport   = currentTransport;
+  const transportSnap  = legTransport ? { ...TRANSPORT[legTransport] } : null;
+  const effectiveZoom  = zoom ?? 10;
+
+  // Hide the current fan (keep it alive for replay — don't remove it)
+  if (currentMarker) {
+    currentMarker.hide();
+    currentMarker = null;
+  }
+
+  const newCoord  = [longitude, latitude];
+  const fromCoord = routeCoords[routeCoords.length - 1];
+
+  // Apply transport line colour (fallback to default brown)
+  const lineColour = transportSnap?.lineColor ?? '#7B3F00';
+  if (map.getLayer('route-line')) {
+    map.setPaintProperty('route-line', 'line-color', lineColour);
+  }
+
+  const FLY_DURATION = 4000;
+
+  // Unified RAF loop — route line and emoji share the same clock
+  animateRouteAndMarker(legTransport, fromCoord, newCoord, FLY_DURATION, routeCoords);
+
+  map.flyTo(makeFlyOptions(newCoord, effectiveZoom, FLY_DURATION));
+
+  // Push the log entry immediately so the fan callback can reference it by index
+  const logEntry = {
+    coords:       newCoord,
+    display_name,
+    description:  description ?? '',
+    zoom:         effectiveZoom,
+    fan:          null,          // filled in below once the fan is created
+    transport:    legTransport,
+    transportDef: transportSnap,
+    lineColor:    lineColour,
+  };
+  tripLog.push(logEntry);
+
+  if (tripLog.length >= 2) {
+    replayBar.classList.add('visible');
+  }
+
+  // Create the MapPhotoFan after the fly animation settles (+200 ms buffer)
+  setTimeout(() => {
+    const fan    = new MapPhotoFan(newCoord, map);
+    currentMarker = fan;
+    logEntry.fan  = fan;          // safe: we hold a direct reference, no index lookup
+  }, FLY_DURATION + 200);
+
+  // Reset so the next leg requires a fresh transport choice
+  currentTransport = null;
+
+  // Overlay label
+  flyLabel.textContent = display_name;
+  flyLabel.classList.add('visible');
+  setTimeout(() => flyLabel.classList.remove('visible'), 5000);
+
+  return {
+    success:     true,
+    flew_to:     display_name,
+    coordinates: { latitude, longitude },
+    zoom:        effectiveZoom,
+    transport:   legTransport,
+  };
+}
+
+function set_transport({ mode, emoji, custom_label }) {
+  // For custom mode, hydrate the TRANSPORT slot on the fly
+  if (mode === 'custom') {
+    if (!emoji) return { error: 'custom mode requires an emoji' };
+    TRANSPORT.custom = {
+      emoji:     emoji.trim(),
+      label:     custom_label?.trim() || `by ${emoji.trim()}`,
+      lineColor: '#6a3d9a',
+    };
+  }
+
+  if (!TRANSPORT[mode]) return { error: `Unknown transport mode: ${mode}` };
+  currentTransport = mode;
+
+  const colour = TRANSPORT[mode].lineColor;
+  if (map.getLayer('route-line')) {
+    map.setPaintProperty('route-line', 'line-color', colour);
+  }
+
+  return { success: true, mode, label: TRANSPORT[mode].label };
+}
+
+function dispatch_tool(name, input) {
+  if (name === 'resolve_location') return resolve_location(input);
+  if (name === 'fly_to_location')  return Promise.resolve(fly_to_location(input));
+  if (name === 'set_transport')    return Promise.resolve(set_transport(input));
+  return Promise.resolve({ error: `Unknown tool: ${name}` });
+}
+
+// ─────────────────────────────────────────
+// CONVERSATION STATE
+// Persistent message history so Carte can ask follow-up questions
+// ─────────────────────────────────────────
+const conversationHistory = [];
+
+const systemPrompt = `You are Carte, a warm and curious AI travel companion. You help people tell the story of their journeys on an interactive map.
+
+Your job in every turn:
+1. Read what the user said.
+2. If you now know BOTH a destination AND how they got there, call set_transport (if a mode was mentioned) then resolve_location then fly_to_location, and finish with a short evocative 1–2 sentence description of the place that matches the transport ("touched down in…", "rolled into…", "drove through…").
+3. If you know the destination but NOT how they got there, ask ONE short friendly question about transport before doing anything else. E.g. "Love it! Did you fly, take the train, or drive to get there?"
+4. If you do NOT yet know the destination, ask where they went. Keep it warm and brief.
+5. After landing at a location, end your message with a new question inviting them to share the next stop — e.g. "Where did you head next?" or "What was your next adventure?"
+
+Transport modes you understand:
+- plane / flew / flight / flying → set_transport mode="plane"
+- train / rail / eurostar / bullet train / tram / metro / subway → set_transport mode="train"
+- car / drove / driving / road trip → set_transport mode="car"
+- ANYTHING ELSE (bus, coach, bike, bicycle, cycling, ferry, boat, ship, cruise, motorbike, motorcycle, horse, walking, hiking, skateboard, rickshaw, canoe, kayak, helicopter, etc.) → set_transport mode="custom" with an appropriate emoji and label. Examples: bus→{emoji:"🚌",custom_label:"by bus"}, bike→{emoji:"🚲",custom_label:"by bike"}, ferry→{emoji:"⛴️",custom_label:"by ferry"}, horse→{emoji:"🐎",custom_label:"on horseback"}, helicopter→{emoji:"🚁",custom_label:"by helicopter"}.
+
+TOOL RULES:
+- Always call resolve_location before fly_to_location. Never invent coordinates.
+- Call set_transport BEFORE fly_to_location when a mode is known.
+- Zoom guidance: ~3 continents, ~5 countries, ~10–11 cities, ~14–15 landmarks.
+
+TONE: Conversational, enthusiastic, like a friend who loves travel. Short sentences. No bullet lists in chat.`;
+
+// ─────────────────────────────────────────
+// CLAUDE AGENT LOOP
+// ─────────────────────────────────────────
+async function runAgent(userMessage) {
+  conversationHistory.push({ role: 'user', content: userMessage });
+
+  while (true) {
+    const res = await fetch(ANTHROPIC_PROXY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        system: systemPrompt,
+        tools,
+        messages: conversationHistory,
+      }),
+    });
+
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message ?? JSON.stringify(data.error));
+
+    conversationHistory.push({ role: 'assistant', content: data.content });
+
+    // Partition the response into tool calls and plain text blocks in one pass
+    const toolCalls = [];
+    const textParts = [];
+    for (const block of data.content) {
+      if (block.type === 'tool_use')  toolCalls.push(block);
+      else if (block.type === 'text') textParts.push(block.text);
+    }
+
+    // No tool calls → pure text reply; return it to the caller
+    if (toolCalls.length === 0) return textParts.join('\n');
+
+    // Execute all tool calls in parallel, log each one
+    const results = await Promise.all(
+      toolCalls.map(async tc => {
+        appendLog('tool', null, `⚙ ${tc.name}(${JSON.stringify(tc.input)})`);
+        let result;
+        try   { result = await dispatch_tool(tc.name, tc.input); }
+        catch (e) { result = { error: e.message }; }
+        return { type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(result) };
+      })
+    );
+
+    conversationHistory.push({ role: 'user', content: results });
+  }
+}
+
+// ─────────────────────────────────────────
+// WELCOME — Carte opens the conversation
+// ─────────────────────────────────────────
+const FALLBACK_GREETING = "Where in the world have you been? Tell me everything ✈️";
+
+async function startConversation() {
+  conversationHistory.push({
+    role: 'user',
+    content: '[SYSTEM] The user just opened the app. Greet them warmly and ask where their travels have taken them. One or two sentences max.'
+  });
+
+  try {
+    const res = await fetch(ANTHROPIC_PROXY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 120,
+        system: systemPrompt,
+        tools,
+        messages: conversationHistory,
+      })
+    });
+    const data     = await res.json();
+    const greeting = data.content?.filter(b => b.type === 'text').map(b => b.text).join('')
+                     || FALLBACK_GREETING;
+    conversationHistory.push({ role: 'assistant', content: data.content });
+    welcomeMsg.textContent = greeting;
+  } catch (_) {
+    welcomeMsg.textContent = FALLBACK_GREETING;
+  }
+}
+
+// ─────────────────────────────────────────
+// REPLAY ENGINE
+// ─────────────────────────────────────────
+let replayAborted = false;
+
+// ── Replay helpers ────────────────────────
+
+/**
+ * Resolves when the user clicks the Next button.
+ * Rejects with Error('aborted') if the stop button fires first.
+ */
+function waitForNext() {
+  return new Promise((resolve, reject) => {
+    function onNext()  { hudNextBtn._abortFn = null; resolve(); }
+    function onAbort() { hudNextBtn._abortFn = null; reject(new Error('aborted')); }
+    hudNextBtn.addEventListener('click', onNext, { once: true });
+    hudNextBtn._abortFn = onAbort;
+  });
+}
+
+/** Rebuild the progress dot row. Dots are emoji icons when a transport is known. */
+function buildHudDots(activeIdx) {
+  const total = tripLog.length;
+  hudDotsEl.innerHTML = '';
+  for (let i = 0; i < total; i++) {
+    const stop  = tripLog[i];
+    const state = i < activeIdx ? 'done' : i === activeIdx ? 'active' : '';
+    const emoji = stop.transportDef?.emoji;
+    const d     = document.createElement('div');
+    if (emoji) {
+      d.className   = `hud-dot-icon ${state}`;
+      d.textContent = emoji;
+    } else {
+      d.className = `hud-dot ${state}`;
+    }
+    d.title = stop.display_name ?? '';
+    hudDotsEl.appendChild(d);
+  }
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Promise wrapper around animateRouteAndMarker. */
+function animateSegment(baseCoords, fromCoord, toCoord, duration, transportMode, transportDef) {
+  return new Promise(resolve => {
+    animateRouteAndMarker(transportMode, fromCoord, toCoord, duration, baseCoords, resolve, transportDef);
+  });
+}
+
+async function replayTrip() {
+  if (tripLog.length < 2) return;
+  replayAborted = false;
+
+  // Lock UI (sendBtn / inputEl are module-level cached refs)
+  replayBtn.disabled = true;
+  stopBtn.classList.add('visible');
+  sendBtn.disabled   = true;
+  inputEl.disabled   = true;
+  hudEl.classList.add('visible');
+  hudNextBtn.disabled = true;
+
+  // Wire stop button to abort any pending waitForNext
+  const origStopHandler = stopBtn.onclick;
+  stopBtn.onclick = () => {
+    replayAborted = true;
+    hudNextBtn._abortFn?.();
+  };
+
+  // Hide all fans and reset the route line to origin only
+  tripLog.forEach(s => s.fan?.hide());
+  currentMarker = null;
+
+  const originCoords = [ORIGIN];
+  map.getSource('route').setData({
+    type: 'Feature',
+    geometry: { type: 'LineString', coordinates: originCoords }
+  });
+
+  // Fly back to overview
+  map.flyTo({ center: ORIGIN, zoom: 3, pitch: 20, bearing: 0, duration: 2000 });
+  await sleep(2200);
+
+  const FLY_DUR    = 3800;
+  let drawnCoords  = [ORIGIN.slice()];
+
+  try {
+    for (let i = 0; i < tripLog.length; i++) {
+      if (replayAborted) break;
+
+      const stop = tripLog[i];
+      const from = i === 0 ? ORIGIN : tripLog[i - 1].coords;
+
+      // Update HUD
+      hudNextBtn.disabled  = true;
+      hudNextBtn.textContent = 'flying…';
+      buildHudDots(i);
+      hudStopLabel.textContent  = `Stop ${i + 1} of ${tripLog.length}`;
+      hudNameLabel.textContent  = stop.display_name;
+      hudTransport.textContent  = stop.transportDef?.label ?? '';
+
+      if (map.getLayer('route-line')) {
+        map.setPaintProperty('route-line', 'line-color', stop.lineColor ?? '#7B3F00');
+      }
+
+      // Fly + animate line+emoji in parallel (shared RAF clock)
+      map.flyTo(makeFlyOptions(stop.coords, stop.zoom, FLY_DUR));
+      await animateSegment(drawnCoords, from, stop.coords, FLY_DUR, stop.transport, stop.transportDef);
+
+      stop.fan?.show();
+
+      flyLabel.textContent = stop.display_name;
+      flyLabel.classList.add('visible');
+
+      // Last stop → "Done ✓", all others → "Next →"
+      hudNextBtn.textContent = (i === tripLog.length - 1) ? 'Done ✓' : 'Next →';
+      hudNextBtn.disabled    = false;
+      await waitForNext();
+      flyLabel.classList.remove('visible');
+    }
+  } catch (_) {
+    // aborted — fall through to cleanup
+  }
+
+  // Commit whatever was drawn
+  map.getSource('route').setData({
+    type: 'Feature',
+    geometry: { type: 'LineString', coordinates: drawnCoords }
+  });
+
+  if (!replayAborted) {
+    buildHudDots(tripLog.length); // mark all dots done
+    currentMarker = tripLog[tripLog.length - 1].fan ?? null;
+  }
+
+  // Restore UI
+  flyLabel.classList.remove('visible');
+  hudEl.classList.remove('visible');
+  stopBtn.classList.remove('visible');
+  stopBtn.onclick     = origStopHandler;
+  hudNextBtn.disabled = true;
+  replayBtn.disabled  = false;
+  sendBtn.disabled    = false;
+  inputEl.disabled    = false;
+}
+
+// ─────────────────────────────────────────
+// UI HELPERS
+// ─────────────────────────────────────────
+
+function appendLog(role, label, content) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  if (label) {
+    const l = document.createElement('div');
+    l.className = 'msg-label';
+    l.textContent = label;
+    div.appendChild(l);
+  }
+
+  const bubble = document.createElement('div');
+  bubble.className  = 'msg-bubble';
+  bubble.textContent = content;
+  div.appendChild(bubble);
+
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+// ─────────────────────────────────────────
+// EVENT HANDLING
+// ─────────────────────────────────────────
+
+// ── LIGHTBOX ─────────────────────────────
+lightboxCloseBtn.addEventListener('click', closeLightbox);
+lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+// ── CHAT ─────────────────────────────────
+
+async function handleSend() {
+  const query = inputEl.value.trim();
+  if (!query) return;
+
+  inputEl.value = '';
+  sendBtn.disabled = true;
+
+  appendLog('user', 'You', query);
+
+  const thinkingEl = appendLog('assistant', 'Carte', '');
+  thinkingEl.querySelector('.msg-bubble').innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const reply = await runAgent(query);
+    const bubble = thinkingEl.querySelector('.msg-bubble');
+    bubble.innerHTML = '';
+    bubble.textContent = reply;
+  } catch (err) {
+    thinkingEl.querySelector('.msg-bubble').textContent = `Error: ${err.message}`;
+  }
+
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+sendBtn.addEventListener('click', handleSend);
+inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') handleSend(); });
+
+// ── REPLAY ───────────────────────────────
+replayBtn.addEventListener('click', replayTrip);
+stopBtn.addEventListener('click', () => { replayAborted = true; });
+
+// ── CUSTOM TRANSPORT ─────────────────────
+
+customToggleBtn.addEventListener('click', () => {
+  const open = customTransport.classList.toggle('visible');
+  customToggleBtn.textContent = open ? '− custom transport' : '+ custom transport';
+  if (open) customEmojiInput.focus();
+});
+
+customSetBtn.addEventListener('click', () => {
+  const emoji = customEmojiInput.value.trim();
+  const label = customLabelInput.value.trim();
+  if (!emoji) { customEmojiInput.focus(); return; }
+  set_transport({ mode: 'custom', emoji, custom_label: label || null });
+  // Brief amber feedback on the toggle button
+  customToggleBtn.style.color = 'var(--amber)';
+  customToggleBtn.textContent = `✓ ${emoji} ${TRANSPORT.custom.label}`;
+  setTimeout(() => {
+    customToggleBtn.style.color = '';
+    customToggleBtn.textContent = '− custom transport';
+  }, 2500);
+});
+
+customLabelInput.addEventListener('keydown', e => { if (e.key === 'Enter') customSetBtn.click(); });
+
+// ─────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────
+startConversation();
+</script>
+</body>
+</html>
