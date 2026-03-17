@@ -16,7 +16,7 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── CONFIG ──────────────────────────────────────────────
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const ANTHROPIC_KEY = process.env.Claude_KEY || "YOUR_ANTHROPIC_API_KEY_HERE";
 
 // ── MIME TYPES ──────────────────────────────────────────

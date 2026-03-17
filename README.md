@@ -1,6 +1,6 @@
 # Carte — AI Map Storyteller
 
-An interactive map storytelling app powered by Claude and Mapbox. Chat with Carte, an AI travel companion, and watch your journey come to life — cinematic globe fly-throughs, animated transport markers, colour-coded route lines, and a photo fan at every stop.
+An interactive storytelling web and mobile app powered by Claude and Mapbox. Chat with Carte, an AI travel tool, and watch your journey come to life — cinematic globe fly-through, animated transport markers, colour-coded route lines, and a photo fan at every stop. Live on  https://map-storry-telling.onrender.com. 
 
 ---
 

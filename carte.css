@@ -618,3 +618,18 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
   transition: background 0.15s;
 }
 #lightbox-close:hover { background: rgba(255,255,255,0.25); }
+
+/* ── PHOTO NUDGE ── */
+.msg.photo-nudge .msg-bubble {
+  background: rgba(200,131,42,0.08);
+  border: 1px dashed rgba(200,131,42,0.5);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  color: var(--amber-dim);
+  padding: 9px 13px;
+  line-height: 1.5;
+}
+.msg.photo-nudge .msg-bubble strong {
+  color: var(--amber);
+  font-weight: 600;
+}

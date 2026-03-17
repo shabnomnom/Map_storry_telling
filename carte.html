@@ -9,7 +9,7 @@
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
 
-  <link rel="stylesheet" href="atlas.css" />
+  <link rel="stylesheet" href="carte.css" />
 </head>
 <body>
 
@@ -77,6 +77,22 @@ const ANTHROPIC_PROXY = window.location.hostname === 'localhost'
 /** Default starting coordinate (New York City) — declared first, used everywhere */
 const ORIGIN = [-74.006, 40.7128];
 
+/** Animation durations (ms) */
+const DURATIONS = {
+  fly:         4000,  // live fly_to_location animation
+  flyReplay:   3800,  // replay segment animation
+  flyOverview: 2000,  // replay fly-back-to-origin
+  overviewWait: 2200, // sleep after fly-back before replay starts
+};
+
+/** Fallback route line colour (plane / no transport selected) */
+const DEFAULT_LINE_COLOR = '#7B3F00';
+
+/** Claude model + token caps */
+const CLAUDE_MODEL      = 'claude-sonnet-4-20250514';
+const CLAUDE_MAX_TOKENS = 1000;
+const CLAUDE_MAX_TOKENS_GREETING = 120;
+
 // ─────────────────────────────────────────
 // MAPBOX INIT
 // ─────────────────────────────────────────
@@ -113,7 +129,7 @@ map.on('load', () => {
     source: 'route',
     layout: { 'line-join': 'round', 'line-cap': 'round' },
     paint: {
-      'line-color': '#7B3F00',
+      'line-color': DEFAULT_LINE_COLOR,
       'line-width': 4,
       'line-opacity': 1,
     }
@@ -147,7 +163,7 @@ const tripLog = [];
 
 // Transport state — selected before each new destination
 const TRANSPORT = {
-  plane:  { emoji: '✈️', label: 'by plane', lineColor: '#7B3F00' },
+  plane:  { emoji: '✈️', label: 'by plane', lineColor: DEFAULT_LINE_COLOR },
   train:  { emoji: '🚂', label: 'by train', lineColor: '#1a6faf' },
   car:    { emoji: '🚗', label: 'by car',   lineColor: '#2e7d32' },
   custom: { emoji: '🚲', label: 'by bike',  lineColor: '#6a3d9a' }, // overwritten at runtime
@@ -601,12 +617,12 @@ function fly_to_location({ latitude, longitude, display_name, description, zoom 
   const fromCoord = routeCoords[routeCoords.length - 1];
 
   // Apply transport line colour (fallback to default brown)
-  const lineColour = transportSnap?.lineColor ?? '#7B3F00';
+  const lineColour = transportSnap?.lineColor ?? DEFAULT_LINE_COLOR;
   if (map.getLayer('route-line')) {
     map.setPaintProperty('route-line', 'line-color', lineColour);
   }
 
-  const FLY_DURATION = 4000;
+  const FLY_DURATION = DURATIONS.fly;
 
   // Unified RAF loop — route line and emoji share the same clock
   animateRouteAndMarker(legTransport, fromCoord, newCoord, FLY_DURATION, routeCoords);
@@ -631,10 +647,14 @@ function fly_to_location({ latitude, longitude, display_name, description, zoom 
   }
 
   // Create the MapPhotoFan after the fly animation settles (+200 ms buffer)
+  // Then show a photo nudge in chat so the user knows to add pics before continuing
   setTimeout(() => {
     const fan    = new MapPhotoFan(newCoord, map);
     currentMarker = fan;
     logEntry.fan  = fan;          // safe: we hold a direct reference, no index lookup
+
+    // Show photo nudge — dismissed automatically when the user starts typing
+    showPhotoNudge(display_name);
   }, FLY_DURATION + 200);
 
   // Reset so the next leg requires a fresh transport choice
@@ -714,24 +734,34 @@ TONE: Conversational, enthusiastic, like a friend who loves travel. Short senten
 // ─────────────────────────────────────────
 // CLAUDE AGENT LOOP
 // ─────────────────────────────────────────
+
+/**
+ * Single shared wrapper around the Anthropic proxy.
+ * @param {number} max_tokens
+ * @param {Array}  messages
+ */
+async function callClaude(max_tokens, messages) {
+  const res = await fetch(ANTHROPIC_PROXY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens,
+      system: systemPrompt,
+      tools,
+      messages,
+    }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message ?? JSON.stringify(data.error));
+  return data;
+}
+
 async function runAgent(userMessage) {
   conversationHistory.push({ role: 'user', content: userMessage });
 
   while (true) {
-    const res = await fetch(ANTHROPIC_PROXY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        system: systemPrompt,
-        tools,
-        messages: conversationHistory,
-      }),
-    });
-
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message ?? JSON.stringify(data.error));
+    const data = await callClaude(CLAUDE_MAX_TOKENS, conversationHistory);
 
     conversationHistory.push({ role: 'assistant', content: data.content });
 
@@ -773,18 +803,7 @@ async function startConversation() {
   });
 
   try {
-    const res = await fetch(ANTHROPIC_PROXY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 120,
-        system: systemPrompt,
-        tools,
-        messages: conversationHistory,
-      })
-    });
-    const data     = await res.json();
+    const data     = await callClaude(CLAUDE_MAX_TOKENS_GREETING, conversationHistory);
     const greeting = data.content?.filter(b => b.type === 'text').map(b => b.text).join('')
                      || FALLBACK_GREETING;
     conversationHistory.push({ role: 'assistant', content: data.content });
@@ -873,10 +892,10 @@ async function replayTrip() {
   });
 
   // Fly back to overview
-  map.flyTo({ center: ORIGIN, zoom: 3, pitch: 20, bearing: 0, duration: 2000 });
-  await sleep(2200);
+  map.flyTo({ center: ORIGIN, zoom: 3, pitch: 20, bearing: 0, duration: DURATIONS.flyOverview });
+  await sleep(DURATIONS.overviewWait);
 
-  const FLY_DUR    = 3800;
+  const FLY_DUR    = DURATIONS.flyReplay;
   let drawnCoords  = [ORIGIN.slice()];
 
   try {
@@ -895,7 +914,7 @@ async function replayTrip() {
       hudTransport.textContent  = stop.transportDef?.label ?? '';
 
       if (map.getLayer('route-line')) {
-        map.setPaintProperty('route-line', 'line-color', stop.lineColor ?? '#7B3F00');
+        map.setPaintProperty('route-line', 'line-color', stop.lineColor ?? DEFAULT_LINE_COLOR);
       }
 
       // Fly + animate line+emoji in parallel (shared RAF clock)
@@ -962,6 +981,39 @@ function appendLog(role, label, content) {
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
   return div;
+}
+
+/**
+ * Shows a dismissable photo nudge in the chat log after landing at a new stop.
+ * Disappears automatically when the user focuses the input or starts typing.
+ */
+let _photoNudgeEl = null;
+function showPhotoNudge(placeName) {
+  // Remove any previous nudge
+  _photoNudgeEl?.remove();
+
+  const div = document.createElement('div');
+  div.className = 'msg photo-nudge';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.innerHTML = `📷 Tap <strong>+</strong> on the map pin to add photos of ${placeName}. Then tell me where you went next!`;
+  div.appendChild(bubble);
+
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  _photoNudgeEl = div;
+
+  // Dismiss when user focuses the input field
+  function dismiss() {
+    div.style.transition = 'opacity 0.4s ease';
+    div.style.opacity = '0';
+    setTimeout(() => div.remove(), 420);
+    inputEl.removeEventListener('focus', dismiss);
+    inputEl.removeEventListener('input', dismiss);
+  }
+  inputEl.addEventListener('focus', dismiss, { once: true });
+  inputEl.addEventListener('input', dismiss, { once: true });
 }
 
 // ─────────────────────────────────────────
