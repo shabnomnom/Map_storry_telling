@@ -25,7 +25,9 @@ const MIME = {
   ".js": "application/javascript",
   ".css": "text/css",
   ".json": "application/json",
+  ".webmanifest": "application/manifest+json",
   ".png": "image/png",
+  ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
 };
 
@@ -79,12 +81,20 @@ const server = http.createServer((req, res) => {
   }
 
   // ── STATIC FILES ─────────────────────────────────────
-  let filePath = req.url === "/" ? "/carte.html" : req.url;
+  // Strip query strings so ?v=123 cache-busters still resolve
+  const pathname = req.url.split("?")[0];
+  let filePath = pathname === "/" ? "/carte.html" : pathname;
   filePath = path.join(__dirname, filePath);
   const ext = path.extname(filePath);
-  const contentType = MIME[ext] || "text/plain";
+  // manifest.json must be served as application/manifest+json for PWA install
+  const contentType = filePath.endsWith("manifest.json")
+    ? "application/manifest+json"
+    : MIME[ext] || "text/plain";
 
-  fs.readFile(filePath, "utf8", (err, data) => {
+  // Binary types must NOT be decoded as UTF-8
+  const isBinary = [".png", ".ico"].includes(ext);
+
+  fs.readFile(filePath, isBinary ? null : "utf8", (err, data) => {
     if (err) {
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("Not found");
@@ -94,7 +104,12 @@ const server = http.createServer((req, res) => {
     if (ext === ".html") {
       data = data.replace("__MAPBOX_TOKEN__", process.env.Mapbox_KEY || "");
     }
-    res.writeHead(200, { "Content-Type": contentType });
+    const headers = { "Content-Type": contentType };
+    // Allow the SW to control the entire origin
+    if (filePath.endsWith("sw.js")) {
+      headers["Service-Worker-Allowed"] = "/";
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 });
