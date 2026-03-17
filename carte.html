@@ -9,7 +9,7 @@
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
 
-  <link rel="stylesheet" href="carte.css" />
+  <link rel="stylesheet" href="atlas.css" />
 </head>
 <body>
 
@@ -70,7 +70,9 @@
 // CONFIG
 // ─────────────────────────────────────────
 const MAPBOX_TOKEN    = '__MAPBOX_TOKEN__';
-const ANTHROPIC_PROXY = 'http://localhost:3000/api/claude'; // proxied via server.js
+const ANTHROPIC_PROXY = window.location.hostname === 'localhost'
+  ? 'http://localhost:3000/api/claude'
+  : '/api/claude'; // proxied via server.js
 
 /** Default starting coordinate (New York City) — declared first, used everywhere */
 const ORIGIN = [-74.006, 40.7128];
