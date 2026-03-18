@@ -16,28 +16,24 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 /* ── MAP ── */
 #map { position: fixed; inset: 0; }
 
-/* ── PANEL ── */
-#panel {
-  position: fixed; top: 0; left: 0; bottom: 0;
+/* ── PANEL HEADER (brand bar — sits outside #panel in the DOM) ── */
+#panel-header {
+  position: fixed;
+  top: 0; left: 0;
   width: var(--panel-w);
+  padding: 14px 20px 12px;
   background: var(--fog);
   backdrop-filter: blur(14px);
-  border-right: 1px solid rgba(200,131,42,0.25);
-  display: flex; flex-direction: column;
-  z-index: 10;
-  overflow: hidden;
-  /* iOS PWA: don't let content sit behind the status bar */
-  padding-top: env(safe-area-inset-top, 0px);
-}
-
-#panel-header {
-  padding: 28px 28px 20px;
   border-bottom: 1px solid rgba(200,131,42,0.2);
+  border-right: 1px solid rgba(200,131,42,0.25);
+  z-index: 11;
+  /* iOS notch */
+  padding-top: calc(14px + env(safe-area-inset-top, 0px));
 }
 
 #panel-header h1 {
   font-family: 'Playfair Display', serif;
-  font-size: 2rem;
+  font-size: 1.6rem;
   line-height: 1;
   color: var(--ink);
   letter-spacing: -0.02em;
@@ -56,14 +52,32 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
   text-transform: uppercase;
 }
 
+/* ── PANEL ── */
+#panel {
+  position: fixed;
+  /* sit below the fixed header; 90px ≈ header height incl. notch padding */
+  top: calc(90px + env(safe-area-inset-top, 0px));
+  left: 0; bottom: 0;
+  width: var(--panel-w);
+  background: var(--fog);
+  backdrop-filter: blur(14px);
+  border-right: 1px solid rgba(200,131,42,0.25);
+  display: flex; flex-direction: column;
+  z-index: 10;
+  overflow: hidden;
+}
+
 /* ── LOG ── */
 #log {
-  flex: 1;
+  flex: 0 1 auto;            /* shrink to content; never greedily fills space */
+  max-height: calc(100vh - 90px - 120px); /* cap: full panel minus header & input */
   overflow-y: auto;
-  padding: 20px 24px;
+  -webkit-overflow-scrolling: touch; /* momentum scroll on iOS */
+  padding: 12px 18px 8px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  justify-content: flex-start;
+  gap: 10px;
   scroll-behavior: smooth;
 }
 
@@ -119,9 +133,10 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 
 .msg.system .msg-bubble {
   background: transparent;
-  color: #888;
-  font-size: 0.72rem;
-  border: 1px dashed rgba(0,0,0,0.1);
+  color: #777;
+  font-size: 0.78rem;
+  border: none;
+  padding: 6px 0;
 }
 
 /* location card */
@@ -154,9 +169,10 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 
 /* ── INPUT AREA ── */
 #input-area {
-  padding: 16px 20px 20px;
+  margin-top: auto; /* pushes input to the bottom of the panel */
+  padding: 10px 16px 14px;
   /* iOS PWA: keep the input above the home-indicator bar */
-  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid rgba(200,131,42,0.2);
 }
 
@@ -181,10 +197,8 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 
 #location-input::placeholder { color: #aaa; }
 
-/* shared focus style for all panel text inputs */
-#location-input:focus,
-#custom-emoji-input:focus,
-#custom-label-input:focus { border-color: var(--amber); background: rgba(255,255,255,0.9); }
+/* shared focus style */
+#location-input:focus { border-color: var(--amber); background: rgba(255,255,255,0.9); }
 
 #send-btn {
   padding: 10px 16px;
@@ -204,87 +218,15 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 #send-btn:active { transform: scale(0.97); }
 #send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* On desktop show the full label; short label hidden */
+.btn-label-short { display: none; }
+
 #hint {
   margin-top: 8px;
   font-size: 0.62rem;
   color: #aaa;
   letter-spacing: 0.04em;
 }
-
-/* ── CUSTOM TRANSPORT ROW ── */
-#custom-transport {
-  display: none;
-  align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-}
-#custom-transport.visible { display: flex; }
-
-#custom-transport span {
-  font-size: 0.6rem;
-  color: #999;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-#custom-emoji-input {
-  width: 40px;
-  text-align: center;
-  font-size: 1.1rem;
-  padding: 3px 4px;
-  border: 1px solid rgba(200,131,42,0.3);
-  border-radius: 2px;
-  background: rgba(255,255,255,0.6);
-  font-family: 'DM Mono', monospace;
-  outline: none;
-  flex-shrink: 0;
-  cursor: text;
-}
-
-#custom-label-input {
-  flex: 1;
-  padding: 4px 8px;
-  font-size: 0.72rem;
-  border: 1px solid rgba(200,131,42,0.3);
-  border-radius: 2px;
-  background: rgba(255,255,255,0.6);
-  font-family: 'DM Mono', monospace;
-  color: var(--ink);
-  outline: none;
-}
-#custom-label-input::placeholder { color: #bbb; }
-
-#custom-set-btn {
-  padding: 4px 10px;
-  background: var(--amber);
-  color: #fff;
-  border: none;
-  border-radius: 2px;
-  font-family: 'DM Mono', monospace;
-  font-size: 0.65rem;
-  letter-spacing: 0.05em;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.15s;
-}
-#custom-set-btn:hover { background: var(--amber-dim); }
-
-#custom-toggle-btn {
-  margin-top: 6px;
-  background: none;
-  border: none;
-  padding: 0;
-  font-family: 'DM Mono', monospace;
-  font-size: 0.62rem;
-  color: #aaa;
-  cursor: pointer;
-  letter-spacing: 0.04em;
-  text-decoration: underline dotted;
-  display: block;
-}
-#custom-toggle-btn:hover { color: var(--amber); }
 
 /* transport badge inside chat bubbles */
 .transport-badge {
@@ -636,4 +578,112 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 .msg.photo-nudge .msg-bubble strong {
   color: var(--amber);
   font-weight: 600;
+}
+
+/* ─────────────────────────────────────────
+   MOBILE LAYOUT  ≤ 600px
+   Header stays as a slim fixed top bar.
+   Panel becomes a bottom drawer; map fills the top ~42 vh.
+───────────────────────────────────────────*/
+@media (max-width: 600px) {
+  :root {
+    --bar-h:    44px;
+    --drawer-h: 44vh;   /* shorter drawer → more map visible */
+  }
+
+  /* ── TOP BAR: Carte branding ── */
+  #panel-header {
+    width: 100%;              /* full-width on mobile */
+    border-right: none;
+    border-bottom: 1px solid rgba(200,131,42,0.2);
+    padding: 0 16px;
+    height: calc(var(--bar-h) + env(safe-area-inset-top, 0px));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  #panel-header h1 { font-size: 1.2rem; }
+  #panel-header p  { display: none; }
+
+  /* ── PANEL: bottom drawer only ── */
+  #panel {
+    top: auto;
+    left: 0; right: 0; bottom: 0;
+    width: 100%;
+    height: var(--drawer-h);
+    padding-top: 14px;        /* drag handle space */
+    border-right: none;
+    border-top: 1px solid rgba(200,131,42,0.3);
+    border-radius: 16px 16px 0 0;
+    justify-content: flex-end; /* anchor input to bottom; log floats above it */
+  }
+
+  /* Drag handle pill */
+  #panel::before {
+    content: '';
+    position: absolute;
+    top: 6px; left: 50%;
+    transform: translateX(-50%);
+    width: 36px; height: 4px;
+    background: rgba(200,131,42,0.35);
+    border-radius: 2px;
+  }
+
+  /* ── Chat log ── */
+  #log {
+    flex: 0 1 auto;           /* shrink to content; don't greedily fill space */
+    max-height: calc(var(--drawer-h) - 108px); /* cap before it crowds input */
+    gap: 8px;
+    padding: 8px 14px 4px;
+    overscroll-behavior: contain;
+  }
+
+  /* ── Input ── */
+  #input-area {
+    flex-shrink: 0;
+    padding: 8px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+
+  #hint { font-size: 0.58rem; margin-top: 4px; }
+
+  /* Prevent iOS auto-zoom */
+  #location-input { font-size: 16px; }
+
+  /* Send button: arrow only */
+  .btn-label-full  { display: none; }
+  .btn-label-short { display: inline; }
+  #send-btn { padding: 10px 16px; font-size: 1rem; }
+
+  /* ── Replay HUD: above the drawer ── */
+  #replay-hud {
+    bottom: calc(var(--drawer-h) + 10px);
+    left: 10px; right: 10px;
+    width: auto;
+    padding: 8px 12px;
+    gap: 10px;
+  }
+  #replay-hud .hud-name { font-size: 0.88rem; }
+  #hud-next-btn { padding: 6px 10px; font-size: 0.68rem; }
+
+  /* ── Fly label: between top bar and drawer ── */
+  #fly-label {
+    bottom: calc(var(--drawer-h) + 14px);
+    right: 14px;
+    font-size: 1.6rem;
+    max-width: calc(100vw - 28px);
+  }
+
+  /* ── Mapbox attribution above drawer ── */
+  .mapboxgl-ctrl-bottom-right { bottom: calc(var(--drawer-h) + 4px) !important; }
+  .mapboxgl-ctrl-bottom-left  { bottom: calc(var(--drawer-h) + 4px) !important; }
+
+  /* ── Touch targets ── */
+  .map-add-photo-btn { width: 28px; height: 28px; font-size: 17px; }
+
+  /* ── Replay bar ── */
+  #replay-bar { flex-direction: column; gap: 6px; }
+  #replay-btn, #stop-btn { width: 100%; justify-content: center; }
+
+  .location-card .loc-name { font-size: 0.95rem; }
 }

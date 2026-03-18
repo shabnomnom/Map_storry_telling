@@ -15,6 +15,7 @@ An interactive storytelling web and mobile app powered by Claude and Mapbox. Cha
 - **Photo fan** — add up to 5 photos at each stop; they fan out as a card arc on the map
 - **Lightbox viewer** — click any photo to enlarge it
 - **Trip replay** — replay your full journey step by step with a progress HUD and Next / Stop controls
+- **Mobile-first layout** — bottom-drawer panel on phones (≤ 600 px) so the map fills the top half; safe-area insets for iOS notch/home-bar; momentum scroll; no auto-zoom on inputs
 - **PWA** — installable on desktop (Chrome/Edge) and mobile (iOS Safari, Android Chrome); works offline for the app shell
 
 ---

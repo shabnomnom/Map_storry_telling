@@ -31,12 +31,14 @@
 
 <div id="fly-label"></div>
 
-<div id="panel">
-  <div id="panel-header">
-    <h1>Car<em>te</em></h1>
-    <p>AI-powered map storytelling</p>
-  </div>
+<!-- Brand bar — outside #panel so it can be position:fixed on mobile
+     without being clipped by the panel's backdrop-filter stacking context -->
+<div id="panel-header">
+  <h1>Car<em>te</em></h1>
+  <p>AI-powered map storytelling</p>
+</div>
 
+<div id="panel">
   <div id="log">
     <div class="msg system">
       <div class="msg-bubble" id="welcome-msg"></div>
@@ -45,17 +47,12 @@
 
   <div id="input-area">
     <div id="input-row">
-      <input id="location-input" type="text" placeholder="Tokyo, Japan" autocomplete="off" />
-      <button id="send-btn">Take me there →</button>
+      <input id="location-input" type="text" placeholder="Tokyo, Japan"
+             autocomplete="off" autocorrect="off" autocapitalize="off"
+             spellcheck="false" inputmode="text" enterkeyhint="send" />
+      <button id="send-btn"><span class="btn-label-full">Take me there →</span><span class="btn-label-short">→</span></button>
     </div>
     <div id="hint">powered by Claude + Mapbox</div>
-    <button id="custom-toggle-btn">+ custom transport</button>
-    <div id="custom-transport">
-      <span>got there by</span>
-      <input id="custom-emoji-input" type="text" maxlength="2" placeholder="🚲" title="Paste any emoji" />
-      <input id="custom-label-input" type="text" maxlength="32" placeholder="e.g. bike, ferry, horse…" />
-      <button id="custom-set-btn">set</button>
-    </div>
     <div id="replay-bar">
       <button id="replay-btn">▶ replay trip</button>
       <button id="stop-btn">■ stop</button>
@@ -224,13 +221,6 @@ const sendBtn    = document.getElementById('send-btn');
 const inputEl    = document.getElementById('location-input');
 const flyLabel   = document.getElementById('fly-label');
 const replayBar  = document.getElementById('replay-bar');
-
-// Custom transport UI
-const customToggleBtn  = document.getElementById('custom-toggle-btn');
-const customTransport  = document.getElementById('custom-transport');
-const customEmojiInput = document.getElementById('custom-emoji-input');
-const customLabelInput = document.getElementById('custom-label-input');
-const customSetBtn     = document.getElementById('custom-set-btn');
 
 // Replay HUD
 const hudEl        = document.getElementById('replay-hud');
@@ -1068,45 +1058,20 @@ inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') handleSend(); 
 replayBtn.addEventListener('click', replayTrip);
 stopBtn.addEventListener('click', () => { replayAborted = true; });
 
-// ── CUSTOM TRANSPORT ─────────────────────
-
-customToggleBtn.addEventListener('click', () => {
-  const open = customTransport.classList.toggle('visible');
-  customToggleBtn.textContent = open ? '− custom transport' : '+ custom transport';
-  if (open) customEmojiInput.focus();
-});
-
-customSetBtn.addEventListener('click', () => {
-  const emoji = customEmojiInput.value.trim();
-  const label = customLabelInput.value.trim();
-  if (!emoji) { customEmojiInput.focus(); return; }
-  set_transport({ mode: 'custom', emoji, custom_label: label || null });
-  // Brief amber feedback on the toggle button
-  customToggleBtn.style.color = 'var(--amber)';
-  customToggleBtn.textContent = `✓ ${emoji} ${TRANSPORT.custom.label}`;
-  setTimeout(() => {
-    customToggleBtn.style.color = '';
-    customToggleBtn.textContent = '− custom transport';
-  }, 2500);
-});
-
-customLabelInput.addEventListener('keydown', e => { if (e.key === 'Enter') customSetBtn.click(); });
-
 // ─────────────────────────────────────────
 // BOOT
 // ─────────────────────────────────────────
 
-// Register service worker (PWA offline shell)
-if ('serviceWorker' in navigator) {
+// Register service worker (PWA offline shell) — skip on localhost so the SW
+// never caches stale assets during development.
+if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
   navigator.serviceWorker.register('/sw.js')
-    .then(reg => {
-      // Check for updates on every page load
-      reg.update();
-    })
-    .catch(err => {
-      // Only log in dev — safe to ignore on production HTTPS
-      if (location.hostname === 'localhost') console.warn('[SW] registration failed:', err);
-    });
+    .then(reg => reg.update())
+    .catch(() => {});
+} else if (location.hostname === 'localhost') {
+  // Unregister any previously installed SW so it stops intercepting requests
+  navigator.serviceWorker.getRegistrations()
+    .then(regs => regs.forEach(r => r.unregister()));
 }
 
 startConversation();

@@ -1,11 +1,11 @@
 // sw.js — Carte service worker
 // Strategy:
-//   • App shell (HTML, CSS, icons, manifest) → cache-first, update in background
+//   • App shell (HTML, CSS, icons, manifest) → network-first, cache fallback when offline
 //   • Anthropic proxy (/api/claude) → network-only (never cache AI responses)
 //   • Mapbox tiles / geocoding → network-only (live map data)
-//   • Everything else → network with cache fallback
+//   • Everything else → network-first, cache fallback
 
-const CACHE_NAME = "carte-shell-v1";
+const CACHE_NAME = "carte-shell-v4";
 const SHELL_URLS = [
   "/",
   "/carte.html",
@@ -54,27 +54,24 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Cache-first for everything else (app shell)
+  // Network-first for app shell — always get fresh CSS/HTML, cache only as offline fallback
   event.respondWith(
-    caches.match(request).then((cached) => {
-      const networkFetch = fetch(request)
-        .then((response) => {
-          // Refresh shell cache on successful GETs
-          if (response.ok && request.method === "GET") {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((c) => c.put(request, clone));
-          }
-          return response;
-        })
-        .catch(() => {
-          // Offline fallback: return cached shell for navigation requests
-          if (request.mode === "navigate") {
-            return caches.match("/carte.html");
-          }
-          // For other failed requests (CSS, JS, etc.) return whatever cache has
-          return caches.match(request);
+    fetch(request)
+      .then((response) => {
+        // Update the cache with the fresh response
+        if (response.ok && request.method === "GET") {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((c) => c.put(request, clone));
+        }
+        return response;
+      })
+      .catch(() => {
+        // Offline fallback: serve from cache
+        return caches.match(request).then((cached) => {
+          if (cached) return cached;
+          if (request.mode === "navigate") return caches.match("/carte.html");
+          return new Response("Offline", { status: 503 });
         });
-      return cached ?? networkFetch;
-    })
+      })
   );
 });
