@@ -31,6 +31,28 @@
 
 <div id="fly-label"></div>
 
+<!-- Saved trips sidebar — right edge of the map -->
+<div id="trips-sidebar">
+  <div id="trips-sidebar-header">
+    <span>My Trips</span>
+    <button id="new-trip-btn" title="Start a new trip">＋</button>
+  </div>
+  <div id="trips-list"><!-- tiles injected by JS --></div>
+</div>
+
+<!-- Name-trip dialog (inline, no modal library) -->
+<div id="name-trip-dialog">
+  <div id="name-trip-box">
+    <label for="trip-name-input">Name this trip</label>
+    <input id="trip-name-input" type="text" placeholder="e.g. Euro Summer 2025"
+           maxlength="60" autocomplete="off" />
+    <div id="name-trip-actions">
+      <button id="name-trip-cancel">Cancel</button>
+      <button id="name-trip-save">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Brand bar — outside #panel so it can be position:fixed on mobile
      without being clipped by the panel's backdrop-filter stacking context -->
 <div id="panel-header">
@@ -55,6 +77,7 @@
     <div id="hint">powered by Claude + Mapbox</div>
     <div id="replay-bar">
       <button id="replay-btn">▶ replay trip</button>
+      <button id="save-trip-btn">💾 save trip</button>
       <button id="stop-btn">■ stop</button>
     </div>
   </div>
@@ -231,6 +254,327 @@ const hudDotsEl    = document.getElementById('hud-dots');
 const hudNextBtn   = document.getElementById('hud-next-btn');
 const replayBtn    = document.getElementById('replay-btn');
 const stopBtn      = document.getElementById('stop-btn');
+const saveTripBtn  = document.getElementById('save-trip-btn');
+
+// Trips sidebar
+const tripsSidebar     = document.getElementById('trips-sidebar');
+const tripsList        = document.getElementById('trips-list');
+const newTripBtn       = document.getElementById('new-trip-btn');
+const nameTripDialog   = document.getElementById('name-trip-dialog');
+const tripNameInput    = document.getElementById('trip-name-input');
+const nameTripCancel   = document.getElementById('name-trip-cancel');
+const nameTripSaveBtn  = document.getElementById('name-trip-save');
+
+// ─────────────────────────────────────────
+// INDEXED DB — persistent trip storage
+// ─────────────────────────────────────────
+const DB_NAME    = 'carte-db';
+const DB_VERSION = 1;
+const STORE      = 'trips';
+
+/** Open (or create) the IndexedDB database. Returns a Promise<IDBDatabase>. */
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: 'id' });
+        store.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+/** Wrap an IDBRequest in a Promise. */
+function idbReq(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+/** Generate a simple UUID-like id. */
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+/** Serialise the live tripLog into a storable array (photos as dataUrls). */
+function serialiseStops() {
+  return tripLog.map(stop => ({
+    coords:       stop.coords,
+    display_name: stop.display_name,
+    description:  stop.description,
+    zoom:         stop.zoom,
+    transport:    stop.transport,
+    transportDef: stop.transportDef,
+    lineColor:    stop.lineColor,
+    photos:       stop.fan ? stop.fan.photos.map(p => p.dataUrl) : [],
+  }));
+}
+
+/** Save (or overwrite) the current trip in IndexedDB. Returns the saved record. */
+async function persistTrip(name, existingId = null) {
+  const db   = await openDB();
+  const id   = existingId ?? uid();
+  const now  = Date.now();
+  const stops = serialiseStops();
+  const thumb = stops.flatMap(s => s.photos)[0] ?? null; // first photo across all stops
+
+  const record = { id, name, createdAt: existingId ? undefined : now, updatedAt: now, stops, thumb };
+  // Keep original createdAt if updating
+  if (existingId) {
+    const existing = await idbReq(db.transaction(STORE).objectStore(STORE).get(id));
+    if (existing) record.createdAt = existing.createdAt;
+  }
+  if (!record.createdAt) record.createdAt = now;
+
+  await idbReq(db.transaction(STORE, 'readwrite').objectStore(STORE).put(record));
+  return record;
+}
+
+/** Load all trips ordered by most-recently-updated. */
+async function loadAllTrips() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = e => {
+      const all = e.target.result;
+      all.sort((a, b) => b.updatedAt - a.updatedAt);
+      resolve(all);
+    };
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+/** Delete a trip by id. */
+async function deleteTrip(id) {
+  const db = await openDB();
+  await idbReq(db.transaction(STORE, 'readwrite').objectStore(STORE).delete(id));
+}
+
+// ─────────────────────────────────────────
+// ACTIVE TRIP ID — tracks which saved trip is loaded
+// ─────────────────────────────────────────
+let activeTripId   = null;  // null = unsaved in-progress trip
+let activeTripName = null;
+
+/** Auto-save whenever a new stop is added (called at end of fly_to_location). */
+async function autoSave() {
+  if (!activeTripId && tripLog.length === 0) return;
+  // Only auto-save if already named; otherwise wait for explicit save
+  if (!activeTripId) return;
+  await persistTrip(activeTripName, activeTripId);
+  refreshSidebar();
+}
+
+// ─────────────────────────────────────────
+// TRIPS SIDEBAR
+// ─────────────────────────────────────────
+
+/** Re-render the sidebar tiles from IndexedDB. */
+async function refreshSidebar() {
+  const trips = await loadAllTrips();
+  tripsList.innerHTML = '';
+  if (trips.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'trips-empty';
+    empty.textContent = 'No saved trips yet.';
+    tripsList.appendChild(empty);
+    return;
+  }
+  trips.forEach(trip => {
+    const tile = document.createElement('div');
+    tile.className = 'trip-tile' + (trip.id === activeTripId ? ' active' : '');
+    tile.dataset.id = trip.id;
+
+    // Thumbnail
+    const thumb = document.createElement('div');
+    thumb.className = 'trip-thumb';
+    if (trip.thumb) {
+      const img = document.createElement('img');
+      img.src = trip.thumb;
+      img.alt = trip.name;
+      thumb.appendChild(img);
+    } else {
+      thumb.textContent = '🗺️';
+    }
+
+    // Info
+    const info = document.createElement('div');
+    info.className = 'trip-info';
+
+    const tname = document.createElement('div');
+    tname.className = 'trip-name';
+    tname.textContent = trip.name;
+
+    const tmeta = document.createElement('div');
+    tmeta.className = 'trip-meta';
+    tmeta.textContent = `${trip.stops.length} stop${trip.stops.length !== 1 ? 's' : ''} · ${new Date(trip.updatedAt).toLocaleDateString()}`;
+
+    info.appendChild(tname);
+    info.appendChild(tmeta);
+
+    // Delete button
+    const del = document.createElement('button');
+    del.className = 'trip-delete-btn';
+    del.title = 'Delete trip';
+    del.textContent = '✕';
+    del.addEventListener('click', async e => {
+      e.stopPropagation();
+      if (!confirm(`Delete "${trip.name}"?`)) return;
+      await deleteTrip(trip.id);
+      if (activeTripId === trip.id) { activeTripId = null; activeTripName = null; }
+      refreshSidebar();
+    });
+
+    tile.appendChild(thumb);
+    tile.appendChild(info);
+    tile.appendChild(del);
+    tile.addEventListener('click', () => loadTripFromRecord(trip));
+    tripsList.appendChild(tile);
+  });
+}
+
+/** Restore a saved trip: clear map, rebuild tripLog + fans, redraw route. */
+async function loadTripFromRecord(record) {
+  if (tripLog.length > 0 && activeTripId !== record.id) {
+    if (!confirm(`Load "${record.name}"? Your current unsaved progress will be cleared.`)) return;
+  }
+
+  // Clear existing state
+  clearCurrentTrip();
+
+  activeTripId   = record.id;
+  activeTripName = record.name;
+
+  // Rebuild tripLog + fans without animation (instant restore)
+  const allCoords = [ORIGIN.slice()];
+
+  for (const stop of record.stops) {
+    const logEntry = {
+      coords:       stop.coords,
+      display_name: stop.display_name,
+      description:  stop.description,
+      zoom:         stop.zoom,
+      fan:          null,
+      transport:    stop.transport,
+      transportDef: stop.transportDef,
+      lineColor:    stop.lineColor,
+    };
+    tripLog.push(logEntry);
+    allCoords.push(stop.coords);
+
+    // Rebuild the fan with saved photos
+    const fan = new MapPhotoFan(stop.coords, map);
+    for (const dataUrl of (stop.photos ?? [])) {
+      fan._addPhoto(dataUrl);
+    }
+    logEntry.fan  = fan;
+    currentMarker = fan;
+  }
+
+  // Redraw the full route line
+  routeCoords.length = 0;
+  allCoords.forEach(c => routeCoords.push(c));
+  if (map.getSource('route')) {
+    map.getSource('route').setData({
+      type: 'Feature',
+      geometry: { type: 'LineString', coordinates: allCoords }
+    });
+    // Set last leg colour
+    const lastStop = tripLog[tripLog.length - 1];
+    if (lastStop && map.getLayer('route-line')) {
+      map.setPaintProperty('route-line', 'line-color', lastStop.lineColor ?? DEFAULT_LINE_COLOR);
+    }
+  }
+
+  // Fly to first stop
+  if (tripLog.length > 0) {
+    const first = tripLog[0];
+    map.flyTo(makeFlyOptions(first.coords, first.zoom, 2000));
+    replayBar.classList.add('visible');
+  }
+
+  // Mark tile active
+  refreshSidebar();
+
+  // Announce in chat
+  appendLog('system', null, `📂 Loaded trip: ${record.name} (${tripLog.length} stop${tripLog.length !== 1 ? 's' : ''})`);
+}
+
+/** Wipe the current in-progress trip from the map + memory. */
+function clearCurrentTrip() {
+  // Remove all fans
+  tripLog.forEach(s => s.fan?.remove());
+  tripLog.length   = 0;
+  routeCoords.length = 0;
+  routeCoords.push(ORIGIN.slice());
+  currentMarker    = null;
+  currentTransport = null;
+
+  if (map.getSource('route')) {
+    map.getSource('route').setData({
+      type: 'Feature',
+      geometry: { type: 'LineString', coordinates: [ORIGIN] }
+    });
+    if (map.getLayer('route-line')) {
+      map.setPaintProperty('route-line', 'line-color', DEFAULT_LINE_COLOR);
+    }
+  }
+
+  replayBar.classList.remove('visible');
+}
+
+// ── Name-trip dialog helpers ─────────────
+
+function openNameTripDialog(defaultName = '') {
+  tripNameInput.value = defaultName;
+  nameTripDialog.classList.add('open');
+  setTimeout(() => { tripNameInput.focus(); tripNameInput.select(); }, 50);
+}
+
+function closeNameTripDialog() {
+  nameTripDialog.classList.remove('open');
+}
+
+// Save Trip button
+saveTripBtn.addEventListener('click', () => {
+  if (tripLog.length === 0) return;
+  openNameTripDialog(activeTripName ?? `Trip ${new Date().toLocaleDateString()}`);
+});
+
+nameTripCancel.addEventListener('click', closeNameTripDialog);
+nameTripDialog.addEventListener('click', e => { if (e.target === nameTripDialog) closeNameTripDialog(); });
+
+nameTripSaveBtn.addEventListener('click', async () => {
+  const name = tripNameInput.value.trim();
+  if (!name) { tripNameInput.focus(); return; }
+  closeNameTripDialog();
+  const record = await persistTrip(name, activeTripId);
+  activeTripId   = record.id;
+  activeTripName = record.name;
+  refreshSidebar();
+  appendLog('system', null, `💾 Trip saved: ${name}`);
+});
+
+tripNameInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') nameTripSaveBtn.click();
+  if (e.key === 'Escape') closeNameTripDialog();
+});
+
+// New Trip button
+newTripBtn.addEventListener('click', () => {
+  if (tripLog.length > 0 && !confirm('Start a new trip? Unsaved progress will be cleared.')) return;
+  clearCurrentTrip();
+  activeTripId   = null;
+  activeTripName = null;
+  refreshSidebar();
+  appendLog('system', null, '🆕 New trip started. Where are you heading?');
+});
 
 // ─────────────────────────────────────────
 // LIGHTBOX
@@ -346,6 +690,8 @@ class MapPhotoFan {
     this.photos.push({ dataUrl, wrap, img });
     this._relayout();
     if (this.photos.length >= 5) this._addBtn.style.display = 'none';
+    // Persist updated photos to IndexedDB
+    autoSave();
   }
 
   // Recompute positions/rotations for every photo in the fan
@@ -654,6 +1000,9 @@ function fly_to_location({ latitude, longitude, display_name, description, zoom 
 
     // Show photo nudge — dismissed automatically when the user starts typing
     showPhotoNudge(display_name);
+
+    // Auto-save to IndexedDB if trip is already named
+    autoSave();
   }, FLY_DURATION + 200);
 
   // Reset so the next leg requires a fresh transport choice
@@ -1075,6 +1424,7 @@ if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
 }
 
 startConversation();
+refreshSidebar();
 </script>
 </body>
 </html>
