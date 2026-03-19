@@ -1,1 +1,16 @@
-{"name":"carte","version":"1.0.0","description":"A demo of using LLMs to create interactive map-based stories. Built by Shabnam S. with the Anthropic API.","main":"server.js","type":"module","dependencies":{"@anthropic-ai/sdk":"^0.78.0","nodemon":"^3.1.14","prompt-sync":"^4.2.0"},"scripts":{"start":"nodemon --env-file=.env server.js","test":"echo \"Error: no test specified\" && exit 1"}}
+{
+  "name": "carte",
+  "version": "1.0.0",
+  "description": "A demo of using LLMs to create interactive map-based stories. Built by Shabnam S. with the Anthropic API.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "nodemon --env-file=.env server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "nodemon": "^3.1.14",
+    "prompt-sync": "^4.2.0"
+  }
+}

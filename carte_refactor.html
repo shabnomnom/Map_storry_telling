@@ -23,9 +23,9 @@
     import { initializeApp }                        from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-app.js';
     import { getFirestore, collection, doc,
              getDocs, setDoc, deleteDoc,
-             query, where, orderBy }                from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-firestore.js';
+             query, where }                         from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-firestore.js';
     window.__firebaseModules = { initializeApp, getFirestore, collection, doc,
-                                 getDocs, setDoc, deleteDoc, query, where, orderBy };
+                                 getDocs, setDoc, deleteDoc, query, where };
   </script>
 
   <link rel="stylesheet" href="carte.css" />
@@ -79,6 +79,8 @@
 <div id="panel-header">
   <h1>Car<em>te</em></h1>
   <p>AI-powered map storytelling</p>
+  <!-- Mobile-only trips toggle -->
+  <button id="trips-toggle-btn" title="My Trips" aria-label="My Trips">🗺️ Trips</button>
   <div id="user-badge" title="Your personal URL — share it to sync across devices" style="display:none">
     <span id="user-badge-icon">👤</span>
     <span id="user-badge-name"></span>
@@ -278,6 +280,8 @@ const replayBtn        = document.getElementById('replay-btn');
 const stopBtn          = document.getElementById('stop-btn');
 const saveTripBtn      = document.getElementById('save-trip-btn');
 const tripsList        = document.getElementById('trips-list');
+const tripsSidebar     = document.getElementById('trips-sidebar');
+const tripsToggleBtn   = document.getElementById('trips-toggle-btn');
 const newTripBtn       = document.getElementById('new-trip-btn');
 const nameTripDialog   = document.getElementById('name-trip-dialog');
 const tripNameInput    = document.getElementById('trip-name-input');
@@ -296,6 +300,12 @@ const usernameGo       = document.getElementById('username-go');
 
 let currentUser = new URLSearchParams(location.search).get('u')?.trim().toLowerCase() || null;
 
+// ── In-memory trip cache — declared early so waitForFirebase can reference it ──
+const _tripCache   = new Map();
+const _cacheSet    = r  => _tripCache.set(r.id, r);
+const _cacheDel    = id => _tripCache.delete(id);
+const _cacheSorted = () => [..._tripCache.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+
 function applyUsername(name) {
   currentUser = sanitiseUser(name);
   const url   = new URL(location.href);
@@ -304,6 +314,8 @@ function applyUsername(name) {
   userBadgeName.textContent = currentUser;
   userBadge.style.display   = 'flex';
   usernameDialog.classList.remove('open');
+  // Clear cache so we load THIS user's trips fresh from Firestore
+  _tripCache.clear();
   refreshSidebar();
 }
 
@@ -391,9 +403,19 @@ function _initFirebase() {
 }
 
 (function waitForFirebase(n) {
-  if (window.__firebaseModules) { _initFirebase(); return; }
-  if (n > 0) setTimeout(() => waitForFirebase(n - 1), 120);
-})(25);
+  if (window.__firebaseModules) {
+    _initFirebase();
+    // Only bust cache + re-fetch if we already have a username.
+    // If not, applyUsername() will do it when the user submits the dialog.
+    if (currentUser) {
+      _tripCache.clear();
+      refreshSidebar();
+    }
+    return;
+  }
+  if (n > 0) setTimeout(() => waitForFirebase(n - 1), 300);
+  else if (currentUser) refreshSidebar(); // gave up — fall back to IDB
+})(40);
 
 const useFirebase = () => _db !== null && !!currentUser;
 
@@ -413,19 +435,28 @@ async function fbUpsert(record) {
 }
 
 async function fbLoadAll() {
-  if (!useFirebase()) return null;
-  const { collection, query, where, orderBy, getDocs } = window.__firebaseModules;
+  if (!useFirebase()) {
+    console.log('[Carte] fbLoadAll skipped — useFirebase()=false, _db:', _db, 'currentUser:', currentUser);
+    return null;
+  }
+  const { collection, query, where, getDocs } = window.__firebaseModules;
   try {
+    console.log('[Carte] fbLoadAll — querying Firestore for user:', currentUser);
+    // No orderBy — avoids requiring a composite index; sort in JS instead
     const snap = await getDocs(query(
       collection(_db, 'trips'),
       where('user_id', '==', currentUser),
-      orderBy('updated_at', 'desc'),
     ));
-    return snap.docs.map(d => {
+    console.log('[Carte] fbLoadAll — got', snap.docs.length, 'docs');
+    const results = snap.docs.map(d => {
       const r = d.data();
       return { id: d.id, name: r.name, stops: JSON.parse(r.stops_json), thumb: r.thumb, createdAt: r.created_at, updatedAt: r.updated_at };
     });
-  } catch (e) { console.warn('Firestore fetch error:', e.message); return null; }
+    return results.sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (e) {
+    console.error('[Carte] Firestore fetch error:', e.code, e.message);
+    return null;
+  }
 }
 
 async function fbDelete(id) {
@@ -436,11 +467,7 @@ async function fbDelete(id) {
 }
 
 // ── In-memory cache (single source of truth for the sidebar) ──────────────
-
-const _tripCache   = new Map();
-const _cacheSet    = r  => _tripCache.set(r.id, r);
-const _cacheDel    = id => _tripCache.delete(id);
-const _cacheSorted = () => [..._tripCache.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+// (declared near top of file, before waitForFirebase)
 
 // ── Unified API ───────────────────────────
 
@@ -1250,6 +1277,14 @@ newTripBtn.addEventListener('click', async () => {
   activeTripName = null;
   refreshSidebar();
   appendLog('system', null, '🆕 New trip started. Where are you heading?');
+});
+
+// Mobile trips drawer toggle
+tripsToggleBtn.addEventListener('click', () => {
+  tripsSidebar.classList.toggle('mobile-open');
+});
+document.getElementById('map').addEventListener('click', () => {
+  tripsSidebar.classList.remove('mobile-open');
 });
 
 // ─────────────────────────────────────────
