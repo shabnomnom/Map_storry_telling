@@ -624,6 +624,26 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 }
 #save-trip-btn:hover { background: rgba(200,131,42,0.1); border-color: var(--amber); }
 
+/* ── TRIPS TOGGLE BUTTON (mobile only — hidden on desktop) ── */
+#trips-toggle-btn {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 7px;
+  background: rgba(200,131,42,0.1);
+  border: 1px solid rgba(200,131,42,0.35);
+  border-radius: 20px;
+  font-family: 'DM Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--amber-dim);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+#trips-toggle-btn:hover  { background: rgba(200,131,42,0.18); border-color: var(--amber); }
+#trips-toggle-btn:active { background: rgba(200,131,42,0.25); }
+
 /* ─────────────────────────────────────────
    TRIPS SIDEBAR
 ───────────────────────────────────────────*/
@@ -1026,6 +1046,9 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
   #panel-header h1 { font-size: 1.2rem; }
   #panel-header p  { display: none; }
 
+  /* Show the trips toggle pill on mobile */
+  #trips-toggle-btn { display: flex; margin-left: auto; }
+
   /* ── PANEL: bottom drawer only ── */
   #panel {
     top: auto;
@@ -1107,11 +1130,20 @@ html, body { height: 100%; overflow: hidden; font-family: 'DM Mono', monospace; 
 
   .location-card .loc-name { font-size: 0.95rem; }
 
-  /* ── Sidebar & map: hidden/full-width on mobile ── */
-  #trips-sidebar { display: none; }
+  /* ── Sidebar: hidden by default on mobile, slides in when .mobile-open ── */
+  #trips-sidebar {
+    display: flex;          /* keep it renderable so transition works */
+    top: 0; right: 0;
+    width: min(80vw, 280px);
+    transform: translateX(100%);
+    transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: -4px 0 24px rgba(0,0,0,0.18);
+    z-index: 200;           /* above everything on mobile */
+  }
+  #trips-sidebar.mobile-open { transform: translateX(0); }
   #map { right: 0; }
 
-  /* ── User badge: compact on mobile ── */
-  #user-badge { font-size: 0.58rem; padding: 3px 7px 3px 5px; }
+  /* ── User badge: compact on mobile, no left-auto (trips btn handles spacing) ── */
+  #user-badge { font-size: 0.58rem; padding: 3px 7px 3px 5px; margin-top: 0; }
   #user-badge-icon { display: none; }
 }

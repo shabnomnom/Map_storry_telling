@@ -81,6 +81,8 @@
 <div id="panel-header">
   <h1>Car<em>te</em></h1>
   <p>AI-powered map storytelling</p>
+  <!-- Mobile-only trips toggle -->
+  <button id="trips-toggle-btn" title="My Trips" aria-label="My Trips">🗺️ Trips</button>
   <div id="user-badge" title="Your personal URL — share it to sync across devices" style="display:none">
     <span id="user-badge-icon">👤</span>
     <span id="user-badge-name"></span>
@@ -288,6 +290,8 @@ const stopBtn      = document.getElementById('stop-btn');
 const saveTripBtn  = document.getElementById('save-trip-btn');
 
 // Trips sidebar
+const tripsSidebar    = document.getElementById('trips-sidebar');
+const tripsToggleBtn  = document.getElementById('trips-toggle-btn');
 const tripsList       = document.getElementById('trips-list');
 const newTripBtn      = document.getElementById('new-trip-btn');
 const nameTripDialog  = document.getElementById('name-trip-dialog');
@@ -882,6 +886,15 @@ newTripBtn.addEventListener('click', async () => {
   activeTripName = null;
   refreshSidebar();
   appendLog('system', null, '🆕 New trip started. Where are you heading?');
+});
+
+// Mobile trips drawer toggle
+tripsToggleBtn.addEventListener('click', () => {
+  tripsSidebar.classList.toggle('mobile-open');
+});
+// Tap the map to close the drawer on mobile
+document.getElementById('map').addEventListener('click', () => {
+  tripsSidebar.classList.remove('mobile-open');
 });
 
 // ─────────────────────────────────────────
