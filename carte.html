@@ -18,6 +18,16 @@
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
 
+  <!-- Firebase JS SDK (modular CDN, no bundler needed) -->
+  <script type="module">
+    import { initializeApp }                        from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-app.js';
+    import { getFirestore, collection, doc,
+             getDocs, setDoc, deleteDoc,
+             query, where, orderBy }                from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-firestore.js';
+    window.__firebaseModules = { initializeApp, getFirestore, collection, doc,
+                                 getDocs, setDoc, deleteDoc, query, where, orderBy };
+  </script>
+
   <link rel="stylesheet" href="carte.css" />
 </head>
 <body>
@@ -53,11 +63,29 @@
   </div>
 </div>
 
+<!-- Username prompt — shown on first visit if no ?u= in URL -->
+<div id="username-dialog">
+  <div id="username-box">
+    <div id="username-logo">Travel<em>Log</em></div>
+    <p id="username-tagline">Your travel log visualizer</p>
+    <label for="username-input">Choose a username to sync your trips across devices</label>
+    <input id="username-input" type="text" placeholder="e.g. shabnam"
+           maxlength="30" autocomplete="username" spellcheck="false" />
+    <p id="username-hint">Letters, numbers and hyphens only. This becomes part of your URL.</p>
+    <button id="username-go">Start exploring →</button>
+  </div>
+</div>
+
 <!-- Brand bar — outside #panel so it can be position:fixed on mobile
      without being clipped by the panel's backdrop-filter stacking context -->
 <div id="panel-header">
   <h1>Car<em>te</em></h1>
   <p>AI-powered map storytelling</p>
+  <div id="user-badge" title="Your personal URL — share it to sync across devices" style="display:none">
+    <span id="user-badge-icon">👤</span>
+    <span id="user-badge-name"></span>
+    <button id="user-badge-copy" title="Copy your link">⎘</button>
+  </div>
 </div>
 
 <div id="panel">
@@ -98,10 +126,13 @@
 // ─────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────
-const MAPBOX_TOKEN    = '__MAPBOX_TOKEN__';
+const MAPBOX_TOKEN       = '__MAPBOX_TOKEN__';
+const FIREBASE_API_KEY   = '__FIREBASE_API_KEY__';
+const FIREBASE_PROJECT   = '__FIREBASE_PROJECT__';
+const FIREBASE_APP_ID    = '__FIREBASE_APP_ID__';
 const ANTHROPIC_PROXY = window.location.hostname === 'localhost'
   ? 'http://localhost:3000/api/claude'
-  : '/api/claude'; // proxied via server.js
+  : '/api/claude';
 
 /** Default starting coordinate (New York City) — declared first, used everywhere */
 const ORIGIN = [-74.006, 40.7128];
@@ -186,7 +217,7 @@ let currentMarker = null;
 // Travel path coordinates (starts at NYC)
 const routeCoords = [ORIGIN.slice()];
 // Ordered log of every visited stop (for replay).
-// Each entry: { coords, display_name, description, zoom, fan,
+// Each entry: { coords, display_name, description, zoom,
 //               transport, transportDef, lineColor }
 const tripLog = [];
 
@@ -257,29 +288,123 @@ const stopBtn      = document.getElementById('stop-btn');
 const saveTripBtn  = document.getElementById('save-trip-btn');
 
 // Trips sidebar
-const tripsSidebar     = document.getElementById('trips-sidebar');
-const tripsList        = document.getElementById('trips-list');
-const newTripBtn       = document.getElementById('new-trip-btn');
-const nameTripDialog   = document.getElementById('name-trip-dialog');
-const tripNameInput    = document.getElementById('trip-name-input');
-const nameTripCancel   = document.getElementById('name-trip-cancel');
-const nameTripSaveBtn  = document.getElementById('name-trip-save');
+const tripsList       = document.getElementById('trips-list');
+const newTripBtn      = document.getElementById('new-trip-btn');
+const nameTripDialog  = document.getElementById('name-trip-dialog');
+const tripNameInput   = document.getElementById('trip-name-input');
+const nameTripCancel  = document.getElementById('name-trip-cancel');
+const nameTripSaveBtn = document.getElementById('name-trip-save');
+
+// Username / user badge
+const userBadge      = document.getElementById('user-badge');
+const userBadgeName  = document.getElementById('user-badge-name');
+const userBadgeCopy  = document.getElementById('user-badge-copy');
+const usernameDialog = document.getElementById('username-dialog');
+const usernameInput  = document.getElementById('username-input');
+const usernameGo     = document.getElementById('username-go');
 
 // ─────────────────────────────────────────
-// INDEXED DB — persistent trip storage
+// USERNAME & FIREBASE INIT
+// ─────────────────────────────────────────
+
+/**
+ * Current username — read from ?u= query param.
+ * null means not yet set (username dialog will show).
+ */
+let currentUser = new URLSearchParams(location.search).get('u')?.trim().toLowerCase() || null;
+
+/** Sanitise: letters, numbers, hyphens only, max 30 chars */
+const sanitiseUser = s => s.trim().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 30);
+
+/**
+ * Firestore db instance — null until Firebase modules load.
+ * Populated asynchronously; guarded by useFirebase() before every call.
+ */
+let _db = null;
+
+// Wait for the Firebase module <script type="module"> to expose its exports,
+// then initialise Firestore if all three env vars are present.
+function _initFirebase() {
+  const m = window.__firebaseModules;
+  if (!m) return;
+  if (!FIREBASE_API_KEY || FIREBASE_API_KEY.startsWith('__')) return;
+  try {
+    const app = m.initializeApp({
+      apiKey:    FIREBASE_API_KEY,
+      projectId: FIREBASE_PROJECT,
+      appId:     FIREBASE_APP_ID,
+    });
+    _db = m.getFirestore(app);
+  } catch (e) {
+    console.warn('Firebase init error:', e.message);
+  }
+}
+
+// The module script runs asynchronously; poll briefly then give up.
+(function waitForFirebase(attempts) {
+  if (window.__firebaseModules) { _initFirebase(); return; }
+  if (attempts > 0) setTimeout(() => waitForFirebase(attempts - 1), 120);
+})(25);
+
+/** Set the username: update URL, badge, and re-render sidebar */
+function applyUsername(name) {
+  currentUser = sanitiseUser(name);
+  // Update URL without reload
+  const url = new URL(location.href);
+  url.searchParams.set('u', currentUser);
+  history.replaceState({}, '', url.toString());
+  // Show badge
+  userBadgeName.textContent = currentUser;
+  userBadge.style.display = 'flex';
+  usernameDialog.classList.remove('open');
+  refreshSidebar();
+}
+
+// Show username dialog if no ?u= in URL
+if (!currentUser) {
+  usernameDialog.classList.add('open');
+  setTimeout(() => usernameInput.focus(), 80);
+} else {
+  userBadgeName.textContent = currentUser;
+  userBadge.style.display = 'flex';
+}
+
+function handleUsernameGo() {
+  const val = sanitiseUser(usernameInput.value);
+  if (!val) { usernameInput.focus(); return; }
+  applyUsername(val);
+}
+usernameGo.addEventListener('click', handleUsernameGo);
+usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleUsernameGo(); });
+
+// Copy personal URL to clipboard
+userBadgeCopy.addEventListener('click', () => {
+  const url = new URL(location.href);
+  url.searchParams.set('u', currentUser);
+  navigator.clipboard.writeText(url.toString()).then(() => {
+    userBadgeCopy.textContent = '✓';
+    setTimeout(() => { userBadgeCopy.textContent = '⎘'; }, 1800);
+  });
+});
+
+// ─────────────────────────────────────────
+// #region STORAGE LAYER
+// Primary: Firebase Firestore (cross-device sync, keyed by user_id = username)
+// Fallback: IndexedDB (offline / Firebase not configured)
 // ─────────────────────────────────────────
 const DB_NAME    = 'carte-db';
 const DB_VERSION = 1;
-const STORE      = 'trips';
+const IDB_STORE  = 'trips';
 
-/** Open (or create) the IndexedDB database. Returns a Promise<IDBDatabase>. */
+// ── IndexedDB helpers ─────────────────────
+
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = e => {
       const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const store = db.createObjectStore(STORE, { keyPath: 'id' });
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        const store = db.createObjectStore(IDB_STORE, { keyPath: 'id' });
         store.createIndex('updatedAt', 'updatedAt', { unique: false });
       }
     };
@@ -288,7 +413,6 @@ function openDB() {
   });
 }
 
-/** Wrap an IDBRequest in a Promise. */
 function idbReq(req) {
   return new Promise((resolve, reject) => {
     req.onsuccess = e => resolve(e.target.result);
@@ -296,12 +420,31 @@ function idbReq(req) {
   });
 }
 
-/** Generate a simple UUID-like id. */
+async function idbPut(record) {
+  const db = await openDB();
+  await idbReq(db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).put(record));
+}
+
+async function idbGetAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).getAll();
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbDelete(id) {
+  const db = await openDB();
+  await idbReq(db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).delete(id));
+}
+
+// ── Shared helpers ────────────────────────
+
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
-/** Serialise the live tripLog into a storable array (photos as dataUrls). */
 function serialiseStops() {
   return tripLog.map(stop => ({
     coords:       stop.coords,
@@ -315,69 +458,214 @@ function serialiseStops() {
   }));
 }
 
-/** Save (or overwrite) the current trip in IndexedDB. Returns the saved record. */
-async function persistTrip(name, existingId = null) {
-  const db   = await openDB();
-  const id   = existingId ?? uid();
-  const now  = Date.now();
-  const stops = serialiseStops();
-  const thumb = stops.flatMap(s => s.photos)[0] ?? null; // first photo across all stops
+// ── Firebase Firestore helpers ────────────
 
-  const record = { id, name, createdAt: existingId ? undefined : now, updatedAt: now, stops, thumb };
-  // Keep original createdAt if updating
-  if (existingId) {
-    const existing = await idbReq(db.transaction(STORE).objectStore(STORE).get(id));
-    if (existing) record.createdAt = existing.createdAt;
+/** True when Firestore is ready AND a username is set */
+const useFirebase = () => _db !== null && !!currentUser;
+
+/**
+ * Write / overwrite a trip document in Firestore.
+ * Collection: trips  — document ID = record.id
+ * Fields: user_id, name, stops_json, thumb, created_at, updated_at
+ */
+async function fbUpsert(record) {
+  if (!useFirebase()) return;
+  const { doc, setDoc } = window.__firebaseModules;
+  try {
+    await setDoc(doc(_db, 'trips', record.id), {
+      user_id:    currentUser,
+      name:       record.name,
+      stops_json: JSON.stringify(record.stops),
+      thumb:      record.thumb ?? null,
+      created_at: record.createdAt,
+      updated_at: record.updatedAt,
+    });
+  } catch (e) {
+    console.warn('Firestore upsert error:', e.message);
   }
-  if (!record.createdAt) record.createdAt = now;
+}
 
-  await idbReq(db.transaction(STORE, 'readwrite').objectStore(STORE).put(record));
+/**
+ * Fetch all trips for currentUser, ordered newest-first.
+ * Returns an array of app-format records, or null on failure.
+ */
+async function fbLoadAll() {
+  if (!useFirebase()) return null;
+  const { collection, query, where, orderBy, getDocs } = window.__firebaseModules;
+  try {
+    const q   = query(
+      collection(_db, 'trips'),
+      where('user_id', '==', currentUser),
+      orderBy('updated_at', 'desc')
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map(d => {
+      const r = d.data();
+      return {
+        id:        d.id,
+        name:      r.name,
+        stops:     JSON.parse(r.stops_json),
+        thumb:     r.thumb,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      };
+    });
+  } catch (e) {
+    console.warn('Firestore fetch error:', e.message);
+    return null;
+  }
+}
+
+/** Delete one trip document from Firestore. */
+async function fbDelete(id) {
+  if (!useFirebase()) return;
+  const { doc, deleteDoc } = window.__firebaseModules;
+  try {
+    await deleteDoc(doc(_db, 'trips', id));
+  } catch (e) {
+    console.warn('Firestore delete error:', e.message);
+  }
+}
+
+// ── Unified API (used everywhere in the app) ──────────────
+
+/**
+ * In-memory trip cache — the single source of truth for the sidebar UI.
+ * All mutations update this map immediately so refreshSidebar() never has
+ * to wait for a Firestore or IDB round-trip to see the latest state.
+ */
+const _tripCache = new Map(); // id → record
+
+function _cacheSet(record) {
+  _tripCache.set(record.id, record);
+}
+function _cacheDel(id) {
+  _tripCache.delete(id);
+}
+function _cacheSorted() {
+  return [..._tripCache.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/** Save (or overwrite) the current trip. Returns the saved record. */
+async function persistTrip(name, existingId = null) {
+  const id    = existingId ?? uid();
+  const now   = Date.now();
+  const stops = serialiseStops();
+  const thumb = stops.flatMap(s => s.photos)[0] ?? null;
+
+  // Preserve original createdAt from cache or IDB
+  let createdAt = now;
+  if (existingId) {
+    const cached = _tripCache.get(id);
+    if (cached?.createdAt) {
+      createdAt = cached.createdAt;
+    } else {
+      const db  = await openDB();
+      const old = await idbReq(db.transaction(IDB_STORE).objectStore(IDB_STORE).get(id));
+      if (old?.createdAt) createdAt = old.createdAt;
+    }
+  }
+
+  const record = { id, name, createdAt, updatedAt: now, stops, thumb };
+
+  // Update cache immediately — UI sees change before any async I/O
+  _cacheSet(record);
+
+  // Persist to both stores in the background; failures are non-fatal
+  Promise.all([idbPut(record), fbUpsert(record)]).catch(() => {});
+
   return record;
 }
 
-/** Load all trips ordered by most-recently-updated. */
+/** Load all trips for the current user (Firestore first, IDB fallback).
+ *  Populates the in-memory cache and returns sorted results. */
 async function loadAllTrips() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction(STORE, 'readonly');
-    const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = e => {
-      const all = e.target.result;
-      all.sort((a, b) => b.updatedAt - a.updatedAt);
-      resolve(all);
-    };
-    req.onerror = e => reject(e.target.error);
-  });
+  // Return from cache if already populated (avoids redundant async reads)
+  if (_tripCache.size > 0) return _cacheSorted();
+
+  let trips = await fbLoadAll();
+  if (!trips) {
+    // Offline or Firebase not configured — use IndexedDB
+    const all = await idbGetAll();
+    trips = all.sort((a, b) => b.updatedAt - a.updatedAt);
+  } else {
+    // Mirror Firestore results into IDB so offline works after first load
+    trips.forEach(t => idbPut(t).catch(() => {}));
+  }
+
+  // Deduplicate by id — keep the record with the highest updatedAt
+  const seen = new Map();
+  for (const t of trips) {
+    if (!seen.has(t.id) || t.updatedAt > seen.get(t.id).updatedAt) {
+      seen.set(t.id, t);
+    }
+  }
+  const sorted = [...seen.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+
+  // Seed the cache
+  sorted.forEach(t => _cacheSet(t));
+  return sorted;
 }
 
-/** Delete a trip by id. */
+/** Delete a trip everywhere. */
 async function deleteTrip(id) {
-  const db = await openDB();
-  await idbReq(db.transaction(STORE, 'readwrite').objectStore(STORE).delete(id));
+  // Remove from cache immediately — UI updates before I/O completes
+  _cacheDel(id);
+  // Fire-and-forget persistence deletes
+  Promise.all([idbDelete(id), fbDelete(id)]).catch(() => {});
 }
 
 // ─────────────────────────────────────────
-// ACTIVE TRIP ID — tracks which saved trip is loaded
+// ACTIVE TRIP STATE
 // ─────────────────────────────────────────
-let activeTripId   = null;  // null = unsaved in-progress trip
+let activeTripId   = null;
 let activeTripName = null;
 
-/** Auto-save whenever a new stop is added (called at end of fly_to_location). */
+/** Auto-save after each new stop (only if trip already named). */
 async function autoSave() {
-  if (!activeTripId && tripLog.length === 0) return;
-  // Only auto-save if already named; otherwise wait for explicit save
   if (!activeTripId) return;
-  await persistTrip(activeTripName, activeTripId);
-  refreshSidebar();
+  await persistTrip(activeTripName, activeTripId); // cache updated inside persistTrip
+  _renderSidebar(_cacheSorted()); // instant — no I/O wait
 }
+
+// #endregion STORAGE LAYER
 
 // ─────────────────────────────────────────
 // TRIPS SIDEBAR
 // ─────────────────────────────────────────
 
-/** Re-render the sidebar tiles from IndexedDB. */
+/**
+ * A non-blocking replacement for window.confirm().
+ * Appends a small dialog to document.body and resolves true/false.
+ */
+function inlineConfirm(message) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'inline-confirm-overlay';
+    overlay.innerHTML = `
+      <div class="inline-confirm-box">
+        <p>${message}</p>
+        <div class="inline-confirm-btns">
+          <button class="inline-confirm-cancel">Cancel</button>
+          <button class="inline-confirm-ok">OK</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const cleanup = val => { overlay.remove(); resolve(val); };
+    overlay.querySelector('.inline-confirm-ok').addEventListener('click', () => cleanup(true));
+    overlay.querySelector('.inline-confirm-cancel').addEventListener('click', () => cleanup(false));
+    overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(false); });
+  });
+}
+
+/** Re-render the sidebar tiles. Uses the in-memory cache when warm (instant),
+ *  otherwise does a one-time async load to seed it. */
 async function refreshSidebar() {
   const trips = await loadAllTrips();
+  _renderSidebar(trips);
+}
+
+function _renderSidebar(trips) {
   tripsList.innerHTML = '';
   if (trips.length === 0) {
     const empty = document.createElement('p');
@@ -418,23 +706,26 @@ async function refreshSidebar() {
     info.appendChild(tname);
     info.appendChild(tmeta);
 
-    // Delete button
+    // Delete button — removes from cache & re-renders immediately, no I/O wait
     const del = document.createElement('button');
     del.className = 'trip-delete-btn';
     del.title = 'Delete trip';
     del.textContent = '✕';
-    del.addEventListener('click', async e => {
+    del.addEventListener('click', e => {
       e.stopPropagation();
-      if (!confirm(`Delete "${trip.name}"?`)) return;
-      await deleteTrip(trip.id);
+      e.preventDefault();
+      deleteTrip(trip.id); // updates cache + fires I/O in background
       if (activeTripId === trip.id) { activeTripId = null; activeTripName = null; }
-      refreshSidebar();
+      _renderSidebar(_cacheSorted()); // instant re-render from updated cache
     });
 
     tile.appendChild(thumb);
     tile.appendChild(info);
     tile.appendChild(del);
-    tile.addEventListener('click', () => loadTripFromRecord(trip));
+    tile.addEventListener('click', e => {
+      if (e.target === del || del.contains(e.target)) return;
+      loadTripFromRecord(trip);
+    });
     tripsList.appendChild(tile);
   });
 }
@@ -442,7 +733,8 @@ async function refreshSidebar() {
 /** Restore a saved trip: clear map, rebuild tripLog + fans, redraw route. */
 async function loadTripFromRecord(record) {
   if (tripLog.length > 0 && activeTripId !== record.id) {
-    if (!confirm(`Load "${record.name}"? Your current unsaved progress will be cleared.`)) return;
+    const ok = await inlineConfirm(`Load "${record.name}"? Unsaved progress will be cleared.`);
+    if (!ok) return;
   }
 
   // Clear existing state
@@ -541,7 +833,10 @@ function closeNameTripDialog() {
   nameTripDialog.classList.remove('open');
 }
 
-// Save Trip button
+// ─────────────────────────────────────────
+// NAME-TRIP DIALOG
+// ─────────────────────────────────────────
+
 saveTripBtn.addEventListener('click', () => {
   if (tripLog.length === 0) return;
   openNameTripDialog(activeTripName ?? `Trip ${new Date().toLocaleDateString()}`);
@@ -554,10 +849,10 @@ nameTripSaveBtn.addEventListener('click', async () => {
   const name = tripNameInput.value.trim();
   if (!name) { tripNameInput.focus(); return; }
   closeNameTripDialog();
-  const record = await persistTrip(name, activeTripId);
+  const record = await persistTrip(name, activeTripId); // cache updated inside persistTrip
   activeTripId   = record.id;
   activeTripName = record.name;
-  refreshSidebar();
+  _renderSidebar(_cacheSorted()); // instant — no I/O wait
   appendLog('system', null, `💾 Trip saved: ${name}`);
 });
 
@@ -567,8 +862,11 @@ tripNameInput.addEventListener('keydown', e => {
 });
 
 // New Trip button
-newTripBtn.addEventListener('click', () => {
-  if (tripLog.length > 0 && !confirm('Start a new trip? Unsaved progress will be cleared.')) return;
+newTripBtn.addEventListener('click', async () => {
+  if (tripLog.length > 0) {
+    const ok = await inlineConfirm('Start a new trip? Unsaved progress will be cleared.');
+    if (!ok) return;
+  }
   clearCurrentTrip();
   activeTripId   = null;
   activeTripName = null;
@@ -986,10 +1284,7 @@ function fly_to_location({ latitude, longitude, display_name, description, zoom 
     lineColor:    lineColour,
   };
   tripLog.push(logEntry);
-
-  if (tripLog.length >= 2) {
-    replayBar.classList.add('visible');
-  }
+  replayBar.classList.add('visible');
 
   // Create the MapPhotoFan after the fly animation settles (+200 ms buffer)
   // Then show a photo nudge in chat so the user knows to add pics before continuing
@@ -1424,6 +1719,20 @@ if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
 }
 
 startConversation();
+
+// On boot: purge any IDB records that are stale/corrupt (no updatedAt or
+// mismatched user) so they don't pollute the sidebar via the IDB fallback.
+(async () => {
+  try {
+    const all = await idbGetAll();
+    for (const t of all) {
+      if (!t.updatedAt || !t.id || !Array.isArray(t.stops)) {
+        await idbDelete(t.id);
+      }
+    }
+  } catch (_) {}
+})();
+
 refreshSidebar();
 </script>
 </body>

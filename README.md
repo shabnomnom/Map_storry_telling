@@ -28,6 +28,7 @@ An interactive storytelling web and mobile app powered by Claude and Mapbox. Cha
 | AI | [Anthropic Claude](https://www.anthropic.com/) (`claude-sonnet-4`) via API |
 | Server | Node.js (ESM) — thin HTTP proxy, no framework |
 | Frontend | Single-file HTML + CSS (`carte.html` + `carte.css`) |
+| Storage | [Firebase Firestore](https://firebase.google.com/docs/firestore) (cross-device sync) + IndexedDB (offline fallback) |
 | PWA | Web App Manifest + Service Worker (`sw.js`) |
 
 ---
@@ -63,18 +64,52 @@ npm install
 |---|---|
 | **Mapbox** | [mapbox.com](https://account.mapbox.com/) → Tokens |
 | **Anthropic** | [console.anthropic.com](https://console.anthropic.com/) → API Keys |
+| **Firebase** | [console.firebase.google.com](https://console.firebase.google.com/) → new project → web app registration |
+
+### 2b. Set up Firebase Firestore (cross-device trip sync)
+
+1. Go to [Firebase Console](https://console.firebase.google.com/) and create a new project (or use an existing one).
+2. Click **"Add app"** → **Web** (`</>`), register the app, and copy the config values.
+3. In the left sidebar go to **Build → Firestore Database → Create database**.
+   - Choose **production mode** (you'll add rules in the next step).
+   - Pick any region close to your users.
+4. Open the **Rules** tab and paste these permissive rules (suitable for a personal/hobby app — restrict further if you go public):
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /trips/{tripId} {
+      allow read, write: if true;
+    }
+  }
+}
+```
+
+5. Grab the three values you need from **Project Settings → Your apps → SDK setup**:
+
+| Env var | Firebase config field |
+|---|---|
+| `Firebase_API_KEY` | `apiKey` |
+| `Firebase_PROJECT_ID` | `projectId` |
+| `Firebase_APP_ID` | `appId` |
+
+> Firebase is optional — the app falls back to local IndexedDB if the vars are not set.
 
 ### 3. Set environment variables
 
 ```zsh
 export Mapbox_KEY=pk.eyJ1...
 export Claude_KEY=sk-ant-...
+export Firebase_API_KEY=AIza...
+export Firebase_PROJECT_ID=my-carte-project
+export Firebase_APP_ID=1:123456789:web:abc123
 ```
 
-Or inline when starting the server:
+Or inline:
 
 ```zsh
-Mapbox_KEY=pk.eyJ1... Claude_KEY=sk-ant-... npm start
+Mapbox_KEY=pk... Claude_KEY=sk-ant-... Firebase_API_KEY=AIza... Firebase_PROJECT_ID=my-carte Firebase_APP_ID=1:...:web:... npm start
 ```
 
 ### 4. Run
@@ -134,6 +169,9 @@ The app is deployed on [Render](https://render.com) as a Node.js web service.
 |---|---|
 | `Mapbox_KEY` | Your Mapbox public token |
 | `Claude_KEY` | Your Anthropic API key |
+| `Firebase_API_KEY` | Your Firebase `apiKey` |
+| `Firebase_PROJECT_ID` | Your Firebase `projectId` |
+| `Firebase_APP_ID` | Your Firebase `appId` |
 
 Render auto-deploys on every push to the connected GitHub branch. Make sure `manifest.json`, `sw.js`, and the `icons/` folder are all committed — they are required for PWA install to work.
 

@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Carte — AI Map Storyteller</title>
+
+  <!-- PWA -->
+  <meta name="theme-color" content="#f59e0b" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Carte" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+
+  <!-- Mapbox GL JS -->
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+
+  <!-- Firebase JS SDK (modular CDN) -->
+  <script type="module">
+    import { initializeApp }                        from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-app.js';
+    import { getFirestore, collection, doc,
+             getDocs, setDoc, deleteDoc,
+             query, where, orderBy }                from 'https://www.gstatic.com/firebasejs/11.5.0/firebase-firestore.js';
+    window.__firebaseModules = { initializeApp, getFirestore, collection, doc,
+                                 getDocs, setDoc, deleteDoc, query, where, orderBy };
+  </script>
+
+  <link rel="stylesheet" href="carte.css" />
+</head>
+<body>
+
+<div id="lightbox">
+  <button id="lightbox-close" title="Close">✕</button>
+  <img id="lightbox-img" src="" alt="Photo" />
+</div>
+
+<div id="map"></div>
+<div id="fly-label"></div>
+
+<!-- Saved trips sidebar -->
+<div id="trips-sidebar">
+  <div id="trips-sidebar-header">
+    <span>My Trips</span>
+    <button id="new-trip-btn" title="Start a new trip">＋</button>
+  </div>
+  <div id="trips-list"></div>
+</div>
+
+<!-- Name-trip dialog -->
+<div id="name-trip-dialog">
+  <div id="name-trip-box">
+    <label for="trip-name-input">Name this trip</label>
+    <input id="trip-name-input" type="text" placeholder="e.g. Euro Summer 2025"
+           maxlength="60" autocomplete="off" />
+    <div id="name-trip-actions">
+      <button id="name-trip-cancel">Cancel</button>
+      <button id="name-trip-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Username prompt -->
+<div id="username-dialog">
+  <div id="username-box">
+    <div id="username-logo">Travel<em>log</em></div>
+    <p id="username-tagline">Your travel log visualizer</p>
+    <label for="username-input">Choose a username to sync your trips across devices</label>
+    <input id="username-input" type="text" placeholder="e.g. shabnam"
+           maxlength="30" autocomplete="username" spellcheck="false" />
+    <p id="username-hint">Letters, numbers and hyphens only. This becomes part of your URL.</p>
+    <button id="username-go">Start exploring →</button>
+  </div>
+</div>
+
+<!-- Brand bar -->
+<div id="panel-header">
+  <h1>Car<em>te</em></h1>
+  <p>AI-powered map storytelling</p>
+  <div id="user-badge" title="Your personal URL — share it to sync across devices" style="display:none">
+    <span id="user-badge-icon">👤</span>
+    <span id="user-badge-name"></span>
+    <button id="user-badge-copy" title="Copy your link">⎘</button>
+  </div>
+</div>
+
+<div id="panel">
+  <div id="log">
+    <div class="msg system">
+      <div class="msg-bubble" id="welcome-msg"></div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="input-row">
+      <input id="location-input" type="text" placeholder="Tokyo, Japan"
+             autocomplete="off" autocorrect="off" autocapitalize="off"
+             spellcheck="false" inputmode="text" enterkeyhint="send" />
+      <button id="send-btn">
+        <span class="btn-label-full">Take me there →</span>
+        <span class="btn-label-short">→</span>
+      </button>
+    </div>
+    <div id="hint">powered by Claude + Mapbox</div>
+    <div id="replay-bar">
+      <button id="replay-btn">▶ replay trip</button>
+      <button id="save-trip-btn">💾 save trip</button>
+      <button id="stop-btn">■ stop</button>
+    </div>
+  </div>
+</div>
+
+<!-- Replay HUD -->
+<div id="replay-hud">
+  <div>
+    <div class="hud-stop"      id="hud-stop-label"></div>
+    <div class="hud-name"      id="hud-name-label"></div>
+    <div class="hud-transport" id="hud-transport-label"></div>
+  </div>
+  <div class="hud-dots" id="hud-dots"></div>
+  <button id="hud-next-btn">Next →</button>
+</div>
+
+<script>
+// ─────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────
+const MAPBOX_TOKEN     = '__MAPBOX_TOKEN__';
+const FIREBASE_API_KEY = '__FIREBASE_API_KEY__';
+const FIREBASE_PROJECT = '__FIREBASE_PROJECT__';
+const FIREBASE_APP_ID  = '__FIREBASE_APP_ID__';
+const ANTHROPIC_PROXY  = location.hostname === 'localhost'
+  ? 'http://localhost:3000/api/claude'
+  : '/api/claude';
+
+const ORIGIN = [-74.006, 40.7128]; // New York City
+
+const DURATIONS = {
+  fly:          4000,
+  flyReplay:    3800,
+  flyOverview:  2000,
+  overviewWait: 2200,
+};
+
+const DEFAULT_LINE_COLOR = '#7B3F00';
+
+const CLAUDE_MODEL              = 'claude-sonnet-4-20250514';
+const CLAUDE_MAX_TOKENS         = 1000;
+const CLAUDE_MAX_TOKENS_GREETING = 120;
+
+// ─────────────────────────────────────────
+// SHARED UTILITIES
+// ─────────────────────────────────────────
+
+const sleep           = ms => new Promise(r => setTimeout(r, ms));
+const easeInOutCubic  = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+const lerp            = (a, b, t) => a + (b - a) * t;
+
+/** Compass bearing (degrees) from coordinate a to b. */
+function calcBearing(a, b) {
+  const R    = Math.PI / 180;
+  const dLng = (b[0] - a[0]) * R;
+  const lat1 = a[1] * R, lat2 = b[1] * R;
+  const y    = Math.sin(dLng) * Math.cos(lat2);
+  const x    = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return (Math.atan2(y, x) / R + 360) % 360;
+}
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+const sanitiseUser = s => s.trim().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 30);
+
+// ─────────────────────────────────────────
+// MAPBOX INIT
+// ─────────────────────────────────────────
+mapboxgl.accessToken = MAPBOX_TOKEN;
+
+const map = new mapboxgl.Map({
+  container: 'map',
+  style:     'mapbox://styles/mapbox/outdoors-v12',
+  center:    ORIGIN,
+  zoom:      10,
+  pitch:     40,
+  bearing:   0,
+  projection: 'globe',
+});
+
+/** Shared flyTo options. Used for live, replay, and load-restore flights. */
+function makeFlyOptions(center, zoom, duration) {
+  return {
+    center,
+    zoom,
+    pitch:    zoom > 10 ? 55 : 35,
+    bearing:  Math.random() * 40 - 20,
+    duration,
+    essential: true,
+    curve:    1.6,
+    easing:   easeInOutCubic,
+  };
+}
+
+map.on('load', () => {
+  map.setFog({
+    color:            'rgb(186, 210, 235)',
+    'high-color':     'rgb(36, 92, 223)',
+    'horizon-blend':  0.02,
+    'space-color':    'rgb(11, 11, 25)',
+    'star-intensity': 0.6,
+  });
+
+  map.addSource('route', {
+    type: 'geojson',
+    data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } },
+  });
+
+  map.addLayer({
+    id:     'route-line',
+    type:   'line',
+    source: 'route',
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint:  { 'line-color': DEFAULT_LINE_COLOR, 'line-width': 4, 'line-opacity': 1 },
+  });
+
+  map.addLayer({
+    id:     'route-line-dash',
+    type:   'line',
+    source: 'route',
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint:  {
+      'line-color':     '#ffffff',
+      'line-width':     2,
+      'line-opacity':   0.7,
+      'line-dasharray': [4, 6],
+    },
+  });
+});
+
+// ─────────────────────────────────────────
+// APP STATE
+// ─────────────────────────────────────────
+
+let currentMarker    = null;
+const routeCoords    = [ORIGIN.slice()]; // live route coordinate array
+const tripLog        = [];               // ordered stop log (for replay / save)
+let   currentTransport = null;           // transport mode chosen for the next leg
+
+const TRANSPORT = {
+  plane:  { emoji: '✈️', label: 'by plane', lineColor: DEFAULT_LINE_COLOR },
+  train:  { emoji: '🚂', label: 'by train', lineColor: '#1a6faf' },
+  car:    { emoji: '🚗', label: 'by car',   lineColor: '#2e7d32' },
+  custom: { emoji: '🚲', label: 'by bike',  lineColor: '#6a3d9a' },
+};
+
+// ─────────────────────────────────────────
+// DOM REFS
+// ─────────────────────────────────────────
+
+const lightbox         = document.getElementById('lightbox');
+const lightboxImg      = document.getElementById('lightbox-img');
+const lightboxCloseBtn = document.getElementById('lightbox-close');
+const log              = document.getElementById('log');
+const welcomeMsg       = document.getElementById('welcome-msg');
+const sendBtn          = document.getElementById('send-btn');
+const inputEl          = document.getElementById('location-input');
+const flyLabel         = document.getElementById('fly-label');
+const replayBar        = document.getElementById('replay-bar');
+const hudEl            = document.getElementById('replay-hud');
+const hudStopLabel     = document.getElementById('hud-stop-label');
+const hudNameLabel     = document.getElementById('hud-name-label');
+const hudTransport     = document.getElementById('hud-transport-label');
+const hudDotsEl        = document.getElementById('hud-dots');
+const hudNextBtn       = document.getElementById('hud-next-btn');
+const replayBtn        = document.getElementById('replay-btn');
+const stopBtn          = document.getElementById('stop-btn');
+const saveTripBtn      = document.getElementById('save-trip-btn');
+const tripsList        = document.getElementById('trips-list');
+const newTripBtn       = document.getElementById('new-trip-btn');
+const nameTripDialog   = document.getElementById('name-trip-dialog');
+const tripNameInput    = document.getElementById('trip-name-input');
+const nameTripCancel   = document.getElementById('name-trip-cancel');
+const nameTripSaveBtn  = document.getElementById('name-trip-save');
+const userBadge        = document.getElementById('user-badge');
+const userBadgeName    = document.getElementById('user-badge-name');
+const userBadgeCopy    = document.getElementById('user-badge-copy');
+const usernameDialog   = document.getElementById('username-dialog');
+const usernameInput    = document.getElementById('username-input');
+const usernameGo       = document.getElementById('username-go');
+
+// ─────────────────────────────────────────
+// USERNAME
+// ─────────────────────────────────────────
+
+let currentUser = new URLSearchParams(location.search).get('u')?.trim().toLowerCase() || null;
+
+function applyUsername(name) {
+  currentUser = sanitiseUser(name);
+  const url   = new URL(location.href);
+  url.searchParams.set('u', currentUser);
+  history.replaceState({}, '', url.toString());
+  userBadgeName.textContent = currentUser;
+  userBadge.style.display   = 'flex';
+  usernameDialog.classList.remove('open');
+  refreshSidebar();
+}
+
+if (!currentUser) {
+  usernameDialog.classList.add('open');
+  setTimeout(() => usernameInput.focus(), 80);
+} else {
+  userBadgeName.textContent = currentUser;
+  userBadge.style.display   = 'flex';
+}
+
+function handleUsernameGo() {
+  const val = sanitiseUser(usernameInput.value);
+  if (val) applyUsername(val);
+  else usernameInput.focus();
+}
+usernameGo.addEventListener('click', handleUsernameGo);
+usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleUsernameGo(); });
+
+userBadgeCopy.addEventListener('click', () => {
+  const url = new URL(location.href);
+  url.searchParams.set('u', currentUser);
+  navigator.clipboard.writeText(url.toString()).then(() => {
+    userBadgeCopy.textContent = '✓';
+    setTimeout(() => { userBadgeCopy.textContent = '⎘'; }, 1800);
+  });
+});
+
+// ─────────────────────────────────────────
+// STORAGE — IndexedDB + Firebase Firestore
+// ─────────────────────────────────────────
+
+const DB_NAME   = 'carte-db';
+const DB_VERSION = 1;
+const IDB_STORE = 'trips';
+
+// ── IndexedDB ─────────────────────────────
+
+/** Opens the DB once and resolves with the IDBDatabase instance. */
+const _dbPromise = new Promise((resolve, reject) => {
+  const req = indexedDB.open(DB_NAME, DB_VERSION);
+  req.onupgradeneeded = e => {
+    const db = e.target.result;
+    if (!db.objectStoreNames.contains(IDB_STORE)) {
+      db.createObjectStore(IDB_STORE, { keyPath: 'id' })
+        .createIndex('updatedAt', 'updatedAt', { unique: false });
+    }
+  };
+  req.onsuccess = e => resolve(e.target.result);
+  req.onerror   = e => reject(e.target.error);
+});
+
+/**
+ * Run `fn(store)` inside a transaction on IDB_STORE.
+ * @param {'readonly'|'readwrite'} mode
+ * @param {(store: IDBObjectStore) => IDBRequest} fn
+ */
+async function withIDB(mode, fn) {
+  const db    = await _dbPromise;
+  const store = db.transaction(IDB_STORE, mode).objectStore(IDB_STORE);
+  return new Promise((resolve, reject) => {
+    const req    = fn(store);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+const idbPut    = record => withIDB('readwrite', s => s.put(record));
+const idbDelete = id     => withIDB('readwrite', s => s.delete(id));
+const idbGetAll = ()     => withIDB('readonly',  s => s.getAll());
+
+// ── Firebase Firestore ─────────────────────
+
+let _db = null;
+
+function _initFirebase() {
+  const m = window.__firebaseModules;
+  if (!m || !FIREBASE_API_KEY || FIREBASE_API_KEY.startsWith('__')) return;
+  try {
+    const app = m.initializeApp({ apiKey: FIREBASE_API_KEY, projectId: FIREBASE_PROJECT, appId: FIREBASE_APP_ID });
+    _db = m.getFirestore(app);
+  } catch (e) {
+    console.warn('Firebase init error:', e.message);
+  }
+}
+
+(function waitForFirebase(n) {
+  if (window.__firebaseModules) { _initFirebase(); return; }
+  if (n > 0) setTimeout(() => waitForFirebase(n - 1), 120);
+})(25);
+
+const useFirebase = () => _db !== null && !!currentUser;
+
+async function fbUpsert(record) {
+  if (!useFirebase()) return;
+  const { doc, setDoc } = window.__firebaseModules;
+  try {
+    await setDoc(doc(_db, 'trips', record.id), {
+      user_id:    currentUser,
+      name:       record.name,
+      stops_json: JSON.stringify(record.stops),
+      thumb:      record.thumb ?? null,
+      created_at: record.createdAt,
+      updated_at: record.updatedAt,
+    });
+  } catch (e) { console.warn('Firestore upsert error:', e.message); }
+}
+
+async function fbLoadAll() {
+  if (!useFirebase()) return null;
+  const { collection, query, where, orderBy, getDocs } = window.__firebaseModules;
+  try {
+    const snap = await getDocs(query(
+      collection(_db, 'trips'),
+      where('user_id', '==', currentUser),
+      orderBy('updated_at', 'desc'),
+    ));
+    return snap.docs.map(d => {
+      const r = d.data();
+      return { id: d.id, name: r.name, stops: JSON.parse(r.stops_json), thumb: r.thumb, createdAt: r.created_at, updatedAt: r.updated_at };
+    });
+  } catch (e) { console.warn('Firestore fetch error:', e.message); return null; }
+}
+
+async function fbDelete(id) {
+  if (!useFirebase()) return;
+  const { doc, deleteDoc } = window.__firebaseModules;
+  try { await deleteDoc(doc(_db, 'trips', id)); }
+  catch (e) { console.warn('Firestore delete error:', e.message); }
+}
+
+// ── In-memory cache (single source of truth for the sidebar) ──────────────
+
+const _tripCache   = new Map();
+const _cacheSet    = r  => _tripCache.set(r.id, r);
+const _cacheDel    = id => _tripCache.delete(id);
+const _cacheSorted = () => [..._tripCache.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+
+// ── Unified API ───────────────────────────
+
+function serialiseStops() {
+  return tripLog.map(s => ({
+    coords:       s.coords,
+    display_name: s.display_name,
+    description:  s.description,
+    zoom:         s.zoom,
+    transport:    s.transport,
+    transportDef: s.transportDef,
+    lineColor:    s.lineColor,
+    photos:       s.fan ? s.fan.photos.map(p => p.dataUrl) : [],
+  }));
+}
+
+async function persistTrip(name, existingId = null) {
+  const id    = existingId ?? uid();
+  const now   = Date.now();
+  const stops = serialiseStops();
+  const thumb = stops.flatMap(s => s.photos)[0] ?? null;
+
+  // Preserve original createdAt
+  let createdAt = now;
+  if (existingId) {
+    const cached = _tripCache.get(id);
+    createdAt = cached?.createdAt
+      ?? (await withIDB('readonly', s => s.get(id)).catch(() => null))?.createdAt
+      ?? now;
+  }
+
+  const record = { id, name, createdAt, updatedAt: now, stops, thumb };
+  _cacheSet(record);
+  Promise.all([idbPut(record), fbUpsert(record)]).catch(() => {});
+  return record;
+}
+
+async function loadAllTrips() {
+  if (_tripCache.size > 0) return _cacheSorted();
+
+  let trips = await fbLoadAll();
+  if (!trips) {
+    trips = (await idbGetAll()).sort((a, b) => b.updatedAt - a.updatedAt);
+  } else {
+    trips.forEach(t => idbPut(t).catch(() => {}));
+  }
+
+  // Deduplicate by id, keep newest updatedAt
+  const seen = new Map();
+  for (const t of trips) {
+    if (!seen.has(t.id) || t.updatedAt > seen.get(t.id).updatedAt) seen.set(t.id, t);
+  }
+  const sorted = [...seen.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  sorted.forEach(t => _cacheSet(t));
+  return sorted;
+}
+
+async function deleteTrip(id) {
+  _cacheDel(id);
+  Promise.all([idbDelete(id), fbDelete(id)]).catch(() => {});
+}
+
+// ─────────────────────────────────────────
+// ACTIVE TRIP STATE
+// ─────────────────────────────────────────
+
+let activeTripId   = null;
+let activeTripName = null;
+
+async function autoSave() {
+  if (!activeTripId) return;
+  await persistTrip(activeTripName, activeTripId);
+  _renderSidebar(_cacheSorted());
+}
+
+// ─────────────────────────────────────────
+// LIGHTBOX
+// ─────────────────────────────────────────
+
+function openLightbox(src)  { lightboxImg.src = src; lightbox.classList.add('open'); }
+function closeLightbox() {
+  lightbox.classList.remove('open');
+  setTimeout(() => { lightboxImg.src = ''; }, 250);
+}
+
+lightboxCloseBtn.addEventListener('click', closeLightbox);
+lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+// ─────────────────────────────────────────
+// MAP PHOTO FAN
+// ─────────────────────────────────────────
+
+class MapPhotoFan {
+  constructor(lngLat, map) {
+    this.lngLat = lngLat;
+    this.map    = map;
+    this.photos = [];
+
+    this._root = document.createElement('div');
+    this._root.className = 'map-photo-fan-wrap';
+
+    this._dot = document.createElement('div');
+    this._dot.className = 'map-marker-dot';
+    this._root.appendChild(this._dot);
+
+    this._addBtn = document.createElement('button');
+    this._addBtn.className = 'map-add-photo-btn';
+    this._addBtn.title = 'Add photos to this location';
+    this._addBtn.textContent = '+';
+    this._root.appendChild(this._addBtn);
+
+    this._fileInput = document.createElement('input');
+    this._fileInput.type     = 'file';
+    this._fileInput.accept   = 'image/*';
+    this._fileInput.multiple = true;
+    this._fileInput.style.display = 'none';
+    document.body.appendChild(this._fileInput);
+
+    this._addBtn.addEventListener('click', e => { e.stopPropagation(); this._fileInput.click(); });
+    this._fileInput.addEventListener('change', () => this._handleFiles());
+
+    this._marker = new mapboxgl.Marker({ element: this._root, anchor: 'center' })
+      .setLngLat(lngLat)
+      .addTo(map);
+  }
+
+  _handleFiles() {
+    const slots = 5 - this.photos.length;
+    Array.from(this._fileInput.files).slice(0, slots).forEach(file => {
+      const reader   = new FileReader();
+      reader.onload  = e => this._addPhoto(e.target.result);
+      reader.readAsDataURL(file);
+    });
+    this._fileInput.value = '';
+    if (this.photos.length >= 5) this._addBtn.style.display = 'none';
+  }
+
+  _addPhoto(dataUrl) {
+    if (this.photos.length >= 5) return;
+    const idx  = this.photos.length;
+    const wrap = document.createElement('div');
+    wrap.className = 'map-fan-img-wrap';
+    wrap.style.zIndex = idx + 4;
+
+    const img = document.createElement('img');
+    img.className  = 'map-fan-img';
+    img.src        = dataUrl;
+    img.draggable  = false;
+    img.title      = 'Click to enlarge';
+    img.addEventListener('click', e => { e.stopPropagation(); openLightbox(dataUrl); });
+
+    const badge = document.createElement('div');
+    badge.className   = 'remove-badge';
+    badge.textContent = '✕';
+    badge.title       = 'Remove photo';
+    badge.addEventListener('click', e => {
+      e.stopPropagation();
+      const i = this.photos.findIndex(p => p.wrap === wrap);
+      if (i === -1) return;
+      wrap.remove();
+      this.photos.splice(i, 1);
+      this._relayout();
+      if (this.photos.length < 5) this._addBtn.style.display = '';
+    });
+
+    wrap.appendChild(img);
+    wrap.appendChild(badge);
+    this._root.appendChild(wrap);
+    this.photos.push({ dataUrl, wrap, img });
+    this._relayout();
+    if (this.photos.length >= 5) this._addBtn.style.display = 'none';
+    autoSave();
+  }
+
+  _relayout() {
+    const n = this.photos.length;
+    if (n === 0) return;
+    const spreadDeg = Math.min(40 * (n - 1), 80);
+    const [imgW, imgH, radius] = [72, 84, 72];
+
+    this.photos.forEach(({ wrap }, i) => {
+      const angleDeg = n === 1 ? -90 : -90 - spreadDeg / 2 + (spreadDeg / (n - 1)) * i;
+      const angleRad = (angleDeg * Math.PI) / 180;
+      const bx = radius * Math.cos(angleRad);
+      const by = radius * Math.sin(angleRad);
+      wrap.style.transform = `translate(${bx - imgW / 2}px, ${by - imgH}px) rotate(${angleDeg + 90}deg)`;
+      wrap.style.zIndex    = i + 4;
+      const img = wrap.querySelector('img');
+      img.style.transformOrigin = `${imgW / 2}px ${imgH}px`;
+      img.style.transform       = '';
+    });
+  }
+
+  hide()   { this._root.style.display = 'none'; }
+  show()   { this._root.style.display = ''; }
+  remove() { this._marker.remove(); this._fileInput.remove(); }
+}
+
+// ─────────────────────────────────────────
+// ROUTE ANIMATION  — RAF loop drives both line and emoji marker
+// ─────────────────────────────────────────
+
+/**
+ * @param {string|null}       mode          - transport mode key or null
+ * @param {[number,number]}   fromCoord
+ * @param {[number,number]}   toCoord
+ * @param {number}            duration      - ms
+ * @param {[number,number][]} baseCoords    - live route array; toCoord is pushed when t=1
+ * @param {Function}          [onDone]
+ * @param {object}            [transportDef] - replay snapshot, overrides TRANSPORT[mode]
+ * @returns {Function} cancel
+ */
+function animateRouteAndMarker(mode, fromCoord, toCoord, duration, baseCoords, onDone, transportDef) {
+  const tDef = transportDef ?? (mode ? TRANSPORT[mode] : null) ?? null;
+
+  // Emoji marker
+  let marker = null, markerEl = null;
+  const bearing = (tDef && mode === 'plane') ? calcBearing(fromCoord, toCoord) - 90 : 0;
+
+  if (tDef) {
+    markerEl = Object.assign(document.createElement('div'), {
+      className:   'transport-emoji-marker',
+      textContent: tDef.emoji,
+    });
+    marker = new mapboxgl.Marker({ element: markerEl, anchor: 'center' })
+      .setLngLat(fromCoord)
+      .addTo(map);
+  }
+
+  const routeSource = map.getSource('route');
+  let cancelled = false, startTime = null, rafId = null;
+
+  function frame(ts) {
+    if (cancelled) return;
+    if (startTime === null) startTime = ts;
+
+    const raw = Math.min((ts - startTime) / duration, 1);
+    const t   = easeInOutCubic(raw);
+    const pos = [lerp(fromCoord[0], toCoord[0], t), lerp(fromCoord[1], toCoord[1], t)];
+
+    routeSource?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [...baseCoords, pos] } });
+    if (marker) {
+      marker.setLngLat(pos);
+      if (mode === 'plane') markerEl.style.transform = `translate(-50%, -50%) rotate(${bearing}deg)`;
+    }
+
+    if (raw < 1) { rafId = requestAnimationFrame(frame); return; }
+
+    // Commit final coord
+    baseCoords.push(toCoord);
+    routeSource?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: baseCoords } });
+
+    // Fade-out emoji
+    if (marker) {
+      setTimeout(() => {
+        if (cancelled) return;
+        markerEl.style.transition = 'opacity 0.5s ease';
+        markerEl.style.opacity    = '0';
+        setTimeout(() => { if (!cancelled) marker.remove(); }, 520);
+      }, 350);
+    }
+    onDone?.();
+  }
+
+  rafId = requestAnimationFrame(frame);
+  return () => { cancelled = true; if (rafId) cancelAnimationFrame(rafId); if (marker) marker.remove(); };
+}
+
+/** Promise wrapper around animateRouteAndMarker. */
+const animateSegment = (base, from, to, dur, mode, def) =>
+  new Promise(res => animateRouteAndMarker(mode, from, to, dur, base, res, def));
+
+// ─────────────────────────────────────────
+// TOOL DEFINITIONS (sent to Claude)
+// ─────────────────────────────────────────
+
+const tools = [
+  {
+    name: 'resolve_location',
+    description: 'Resolves a place name into geographic coordinates, a display name, and a short description. Always call before fly_to_location.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Location to resolve, e.g. "Kyoto, Japan"' } },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'set_transport',
+    description: 'Records how the traveller reached the next location. Call BEFORE fly_to_location. Use mode="custom" for anything outside plane/train/car.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        mode:         { type: 'string', enum: ['plane', 'train', 'car', 'custom'] },
+        emoji:        { type: 'string', description: 'Required for custom mode. E.g. "🚲"' },
+        custom_label: { type: 'string', description: 'Required for custom mode. E.g. "by bike"' },
+      },
+      required: ['mode'],
+    },
+  },
+  {
+    name: 'fly_to_location',
+    description: 'Flies the map to given coordinates. Call AFTER resolve_location (and set_transport when known).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        latitude:     { type: 'number' },
+        longitude:    { type: 'number' },
+        display_name: { type: 'string' },
+        description:  { type: 'string', description: 'Short evocative 1–2 sentence description' },
+        zoom:         { type: 'number', description: '~4 countries, ~10 cities, ~14 landmarks' },
+      },
+      required: ['latitude', 'longitude', 'display_name', 'zoom'],
+    },
+  },
+];
+
+// ─────────────────────────────────────────
+// TOOL IMPLEMENTATIONS
+// ─────────────────────────────────────────
+
+async function resolve_location({ query }) {
+  const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_TOKEN}&limit=1`;
+  try {
+    const data = await fetch(url).then(r => r.json());
+    if (!data.features?.length) return { error: `Could not resolve: "${query}"` };
+    const f          = data.features[0];
+    const [lon, lat] = f.center;
+    return {
+      query,
+      latitude:     lat,
+      longitude:    lon,
+      display_name: f.place_name.split(',')[0].trim(),
+      full_name:    f.place_name,
+      place_type:   f.place_type?.[0] ?? 'place',
+    };
+  } catch (e) {
+    return { error: `Geocoding failed: ${e.message}` };
+  }
+}
+
+function fly_to_location({ latitude, longitude, display_name, description, zoom }) {
+  const legTransport  = currentTransport;
+  const transportSnap = legTransport ? { ...TRANSPORT[legTransport] } : null;
+  const effectiveZoom = zoom ?? 10;
+  const newCoord      = [longitude, latitude];
+  const fromCoord     = routeCoords[routeCoords.length - 1];
+  const lineColour    = transportSnap?.lineColor ?? DEFAULT_LINE_COLOR;
+
+  if (currentMarker) { currentMarker.hide(); currentMarker = null; }
+  if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-color', lineColour);
+
+  animateRouteAndMarker(legTransport, fromCoord, newCoord, DURATIONS.fly, routeCoords);
+  map.flyTo(makeFlyOptions(newCoord, effectiveZoom, DURATIONS.fly));
+
+  const logEntry = { coords: newCoord, display_name, description: description ?? '', zoom: effectiveZoom,
+                     fan: null, transport: legTransport, transportDef: transportSnap, lineColor: lineColour };
+  tripLog.push(logEntry);
+  replayBar.classList.add('visible');
+
+  setTimeout(() => {
+    const fan      = new MapPhotoFan(newCoord, map);
+    currentMarker  = fan;
+    logEntry.fan   = fan;
+    showPhotoNudge(display_name);
+    autoSave();
+  }, DURATIONS.fly + 200);
+
+  currentTransport = null;
+
+  flyLabel.textContent = display_name;
+  flyLabel.classList.add('visible');
+  setTimeout(() => flyLabel.classList.remove('visible'), 5000);
+
+  return { success: true, flew_to: display_name, coordinates: { latitude, longitude }, zoom: effectiveZoom, transport: legTransport };
+}
+
+function set_transport({ mode, emoji, custom_label }) {
+  if (mode === 'custom') {
+    if (!emoji) return { error: 'custom mode requires an emoji' };
+    TRANSPORT.custom = { emoji: emoji.trim(), label: custom_label?.trim() || `by ${emoji.trim()}`, lineColor: '#6a3d9a' };
+  }
+  if (!TRANSPORT[mode]) return { error: `Unknown transport mode: ${mode}` };
+  currentTransport = mode;
+  if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-color', TRANSPORT[mode].lineColor);
+  return { success: true, mode, label: TRANSPORT[mode].label };
+}
+
+function dispatch_tool(name, input) {
+  if (name === 'resolve_location') return resolve_location(input);
+  if (name === 'fly_to_location')  return Promise.resolve(fly_to_location(input));
+  if (name === 'set_transport')    return Promise.resolve(set_transport(input));
+  return Promise.resolve({ error: `Unknown tool: ${name}` });
+}
+
+// ─────────────────────────────────────────
+// CONVERSATION
+// ─────────────────────────────────────────
+
+const conversationHistory = [];
+
+/** Push a message into the conversation history. */
+const pushHistory = (role, content) => conversationHistory.push({ role, content });
+
+const systemPrompt = `You are Carte, a warm and curious AI travel companion. You help people tell the story of their journeys on an interactive map.
+
+Your job in every turn:
+1. Read what the user said.
+2. If you know BOTH destination AND transport, call set_transport then resolve_location then fly_to_location, then give a short evocative 1–2 sentence description matching the mode ("touched down in…", "rolled into…").
+3. If you know the destination but NOT transport, ask ONE short friendly question before doing anything else. E.g. "Love it! Did you fly, take the train, or drive?"
+4. If you don't yet know the destination, ask where they went. Warm and brief.
+5. After landing, end with a question inviting the next stop — e.g. "Where did you head next?"
+
+Transport modes:
+- plane/flew/flight → set_transport mode="plane"
+- train/rail/eurostar/metro → set_transport mode="train"
+- car/drove/road trip → set_transport mode="car"
+- ANYTHING ELSE (bus, bike, ferry, boat, horse, hiking, skateboard, etc.) → set_transport mode="custom" with an emoji and label.
+
+TOOL RULES:
+- Always call resolve_location before fly_to_location. Never invent coordinates.
+- Call set_transport BEFORE fly_to_location when mode is known.
+- Zoom: ~3 continents, ~5 countries, ~10–11 cities, ~14–15 landmarks.
+
+TONE: Conversational, enthusiastic, like a friend who loves travel. Short sentences. No bullet lists.`;
+
+// ─────────────────────────────────────────
+// CLAUDE AGENT LOOP
+// ─────────────────────────────────────────
+
+async function callClaude(max_tokens, messages) {
+  const res = await fetch(ANTHROPIC_PROXY, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ model: CLAUDE_MODEL, max_tokens, system: systemPrompt, tools, messages }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message ?? JSON.stringify(data.error));
+  return data;
+}
+
+async function runAgent(userMessage) {
+  pushHistory('user', userMessage);
+
+  while (true) {
+    const data = await callClaude(CLAUDE_MAX_TOKENS, conversationHistory);
+    pushHistory('assistant', data.content);
+
+    const toolCalls = data.content.filter(b => b.type === 'tool_use');
+    const textParts = data.content.filter(b => b.type === 'text').map(b => b.text);
+
+    if (!toolCalls.length) return textParts.join('\n');
+
+    const results = await Promise.all(toolCalls.map(async tc => {
+      appendLog('tool', null, `⚙ ${tc.name}(${JSON.stringify(tc.input)})`);
+      let result;
+      try   { result = await dispatch_tool(tc.name, tc.input); }
+      catch (e) { result = { error: e.message }; }
+      return { type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(result) };
+    }));
+
+    pushHistory('user', results);
+  }
+}
+
+// ─────────────────────────────────────────
+// WELCOME
+// ─────────────────────────────────────────
+
+const FALLBACK_GREETING = "Where in the world have you been? Tell me everything ✈️";
+
+async function startConversation() {
+  pushHistory('user', '[SYSTEM] The user just opened the app. Greet them warmly and ask where their travels have taken them. One or two sentences max.');
+  try {
+    const data     = await callClaude(CLAUDE_MAX_TOKENS_GREETING, conversationHistory);
+    const greeting = data.content.filter(b => b.type === 'text').map(b => b.text).join('') || FALLBACK_GREETING;
+    pushHistory('assistant', data.content);
+    welcomeMsg.textContent = greeting;
+  } catch (_) {
+    welcomeMsg.textContent = FALLBACK_GREETING;
+  }
+}
+
+// ─────────────────────────────────────────
+// REPLAY ENGINE
+// ─────────────────────────────────────────
+
+let replayAborted = false;
+
+function waitForNext() {
+  return new Promise((resolve, reject) => {
+    function onNext()  { hudNextBtn._abortFn = null; resolve(); }
+    hudNextBtn.addEventListener('click', onNext, { once: true });
+    hudNextBtn._abortFn = () => { hudNextBtn._abortFn = null; reject(new Error('aborted')); };
+  });
+}
+
+function buildHudDots(activeIdx) {
+  hudDotsEl.innerHTML = '';
+  tripLog.forEach((stop, i) => {
+    const state = i < activeIdx ? 'done' : i === activeIdx ? 'active' : '';
+    const emoji = stop.transportDef?.emoji;
+    const d     = document.createElement('div');
+    d.className   = emoji ? `hud-dot-icon ${state}` : `hud-dot ${state}`;
+    d.textContent = emoji ?? '';
+    d.title       = stop.display_name ?? '';
+    hudDotsEl.appendChild(d);
+  });
+}
+
+async function replayTrip() {
+  if (tripLog.length < 2) return;
+  replayAborted = false;
+
+  replayBtn.disabled  = true;
+  stopBtn.classList.add('visible');
+  sendBtn.disabled    = true;
+  inputEl.disabled    = true;
+  hudEl.classList.add('visible');
+  hudNextBtn.disabled = true;
+
+  const origStopHandler = stopBtn.onclick;
+  stopBtn.onclick = () => { replayAborted = true; hudNextBtn._abortFn?.(); };
+
+  tripLog.forEach(s => s.fan?.hide());
+  currentMarker = null;
+
+  map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+  map.flyTo({ center: ORIGIN, zoom: 3, pitch: 20, bearing: 0, duration: DURATIONS.flyOverview });
+  await sleep(DURATIONS.overviewWait);
+
+  const drawnCoords = [ORIGIN.slice()];
+
+  try {
+    for (let i = 0; i < tripLog.length; i++) {
+      if (replayAborted) break;
+      const stop = tripLog[i];
+      const from = i === 0 ? ORIGIN : tripLog[i - 1].coords;
+
+      hudNextBtn.disabled    = true;
+      hudNextBtn.textContent = 'flying…';
+      buildHudDots(i);
+      hudStopLabel.textContent = `Stop ${i + 1} of ${tripLog.length}`;
+      hudNameLabel.textContent = stop.display_name;
+      hudTransport.textContent = stop.transportDef?.label ?? '';
+
+      if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-color', stop.lineColor ?? DEFAULT_LINE_COLOR);
+
+      map.flyTo(makeFlyOptions(stop.coords, stop.zoom, DURATIONS.flyReplay));
+      await animateSegment(drawnCoords, from, stop.coords, DURATIONS.flyReplay, stop.transport, stop.transportDef);
+
+      stop.fan?.show();
+      flyLabel.textContent = stop.display_name;
+      flyLabel.classList.add('visible');
+
+      hudNextBtn.textContent = i === tripLog.length - 1 ? 'Done ✓' : 'Next →';
+      hudNextBtn.disabled    = false;
+      await waitForNext();
+      flyLabel.classList.remove('visible');
+    }
+  } catch (_) { /* aborted */ }
+
+  map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: drawnCoords } });
+  if (!replayAborted) {
+    buildHudDots(tripLog.length);
+    currentMarker = tripLog[tripLog.length - 1].fan ?? null;
+  }
+
+  flyLabel.classList.remove('visible');
+  hudEl.classList.remove('visible');
+  stopBtn.classList.remove('visible');
+  stopBtn.onclick     = origStopHandler;
+  hudNextBtn.disabled = true;
+  replayBtn.disabled  = false;
+  sendBtn.disabled    = false;
+  inputEl.disabled    = false;
+}
+
+// ─────────────────────────────────────────
+// CHAT UI HELPERS
+// ─────────────────────────────────────────
+
+function appendLog(role, label, content) {
+  const div    = document.createElement('div');
+  div.className = `msg ${role}`;
+  if (label) {
+    const l = document.createElement('div');
+    l.className   = 'msg-label';
+    l.textContent = label;
+    div.appendChild(l);
+  }
+  const bubble      = document.createElement('div');
+  bubble.className  = 'msg-bubble';
+  bubble.textContent = content;
+  div.appendChild(bubble);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+let _photoNudgeEl = null;
+
+function showPhotoNudge(placeName) {
+  _photoNudgeEl?.remove();
+  const div    = document.createElement('div');
+  div.className = 'msg photo-nudge';
+  const bubble  = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.innerHTML = `📷 Tap <strong>+</strong> on the map pin to add photos of ${placeName}. Then tell me where you went next!`;
+  div.appendChild(bubble);
+  log.appendChild(div);
+  log.scrollTop  = log.scrollHeight;
+  _photoNudgeEl  = div;
+
+  function dismiss() {
+    div.style.transition = 'opacity 0.4s ease';
+    div.style.opacity    = '0';
+    setTimeout(() => div.remove(), 420);
+    inputEl.removeEventListener('focus', dismiss);
+    inputEl.removeEventListener('input', dismiss);
+  }
+  inputEl.addEventListener('focus', dismiss, { once: true });
+  inputEl.addEventListener('input', dismiss, { once: true });
+}
+
+// ─────────────────────────────────────────
+// TRIPS SIDEBAR
+// ─────────────────────────────────────────
+
+function inlineConfirm(message) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'inline-confirm-overlay';
+    overlay.innerHTML = `
+      <div class="inline-confirm-box">
+        <p>${message}</p>
+        <div class="inline-confirm-btns">
+          <button class="inline-confirm-cancel">Cancel</button>
+          <button class="inline-confirm-ok">OK</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const cleanup = val => { overlay.remove(); resolve(val); };
+    overlay.querySelector('.inline-confirm-ok').addEventListener('click', () => cleanup(true));
+    overlay.querySelector('.inline-confirm-cancel').addEventListener('click', () => cleanup(false));
+    overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(false); });
+  });
+}
+
+async function refreshSidebar() {
+  _renderSidebar(await loadAllTrips());
+}
+
+function _renderSidebar(trips) {
+  tripsList.innerHTML = '';
+  if (!trips.length) {
+    const empty = document.createElement('p');
+    empty.className   = 'trips-empty';
+    empty.textContent = 'No saved trips yet.';
+    tripsList.appendChild(empty);
+    return;
+  }
+  trips.forEach(trip => {
+    const tile  = document.createElement('div');
+    tile.className  = `trip-tile${trip.id === activeTripId ? ' active' : ''}`;
+    tile.dataset.id = trip.id;
+
+    const thumb = document.createElement('div');
+    thumb.className = 'trip-thumb';
+    if (trip.thumb) {
+      const img = document.createElement('img');
+      img.src = trip.thumb; img.alt = trip.name;
+      thumb.appendChild(img);
+    } else {
+      thumb.textContent = '🗺️';
+    }
+
+    const info  = document.createElement('div');
+    info.className = 'trip-info';
+
+    const tname = document.createElement('div');
+    tname.className   = 'trip-name';
+    tname.textContent = trip.name;
+
+    const tmeta = document.createElement('div');
+    tmeta.className   = 'trip-meta';
+    tmeta.textContent = `${trip.stops.length} stop${trip.stops.length !== 1 ? 's' : ''} · ${new Date(trip.updatedAt).toLocaleDateString()}`;
+
+    info.appendChild(tname);
+    info.appendChild(tmeta);
+
+    const del = document.createElement('button');
+    del.className   = 'trip-delete-btn';
+    del.title       = 'Delete trip';
+    del.textContent = '✕';
+    del.addEventListener('click', e => {
+      e.stopPropagation();
+      deleteTrip(trip.id);
+      if (activeTripId === trip.id) { activeTripId = null; activeTripName = null; }
+      _renderSidebar(_cacheSorted());
+    });
+
+    tile.appendChild(thumb);
+    tile.appendChild(info);
+    tile.appendChild(del);
+    tile.addEventListener('click', e => { if (!del.contains(e.target)) loadTripFromRecord(trip); });
+    tripsList.appendChild(tile);
+  });
+}
+
+function clearCurrentTrip() {
+  tripLog.forEach(s => s.fan?.remove());
+  tripLog.length      = 0;
+  routeCoords.length  = 0;
+  routeCoords.push(ORIGIN.slice());
+  currentMarker       = null;
+  currentTransport    = null;
+
+  if (map.getSource('route')) {
+    map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+    if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-color', DEFAULT_LINE_COLOR);
+  }
+  replayBar.classList.remove('visible');
+}
+
+async function loadTripFromRecord(record) {
+  if (tripLog.length > 0 && activeTripId !== record.id) {
+    const ok = await inlineConfirm(`Load "${record.name}"? Unsaved progress will be cleared.`);
+    if (!ok) return;
+  }
+
+  clearCurrentTrip();
+  activeTripId   = record.id;
+  activeTripName = record.name;
+
+  const allCoords = [ORIGIN.slice()];
+  for (const stop of record.stops) {
+    const logEntry = { coords: stop.coords, display_name: stop.display_name, description: stop.description,
+                       zoom: stop.zoom, fan: null, transport: stop.transport, transportDef: stop.transportDef, lineColor: stop.lineColor };
+    tripLog.push(logEntry);
+    allCoords.push(stop.coords);
+
+    const fan = new MapPhotoFan(stop.coords, map);
+    (stop.photos ?? []).forEach(url => fan._addPhoto(url));
+    logEntry.fan  = fan;
+    currentMarker = fan;
+  }
+
+  routeCoords.length = 0;
+  allCoords.forEach(c => routeCoords.push(c));
+
+  if (map.getSource('route')) {
+    map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: allCoords } });
+    const last = tripLog[tripLog.length - 1];
+    if (last && map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-color', last.lineColor ?? DEFAULT_LINE_COLOR);
+  }
+
+  if (tripLog.length > 0) {
+    map.flyTo(makeFlyOptions(tripLog[0].coords, tripLog[0].zoom, 2000));
+    replayBar.classList.add('visible');
+  }
+
+  refreshSidebar();
+  appendLog('system', null, `📂 Loaded trip: ${record.name} (${tripLog.length} stop${tripLog.length !== 1 ? 's' : ''})`);
+}
+
+// ─────────────────────────────────────────
+// NAME-TRIP DIALOG
+// ─────────────────────────────────────────
+
+const openNameTripDialog = (defaultName = '') => {
+  tripNameInput.value = defaultName;
+  nameTripDialog.classList.add('open');
+  setTimeout(() => { tripNameInput.focus(); tripNameInput.select(); }, 50);
+};
+const closeNameTripDialog = () => nameTripDialog.classList.remove('open');
+
+saveTripBtn.addEventListener('click', () => {
+  if (tripLog.length) openNameTripDialog(activeTripName ?? `Trip ${new Date().toLocaleDateString()}`);
+});
+nameTripCancel.addEventListener('click', closeNameTripDialog);
+nameTripDialog.addEventListener('click', e => { if (e.target === nameTripDialog) closeNameTripDialog(); });
+
+nameTripSaveBtn.addEventListener('click', async () => {
+  const name = tripNameInput.value.trim();
+  if (!name) { tripNameInput.focus(); return; }
+  closeNameTripDialog();
+  const record   = await persistTrip(name, activeTripId);
+  activeTripId   = record.id;
+  activeTripName = record.name;
+  _renderSidebar(_cacheSorted());
+  appendLog('system', null, `💾 Trip saved: ${name}`);
+});
+
+tripNameInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter')  nameTripSaveBtn.click();
+  if (e.key === 'Escape') closeNameTripDialog();
+});
+
+newTripBtn.addEventListener('click', async () => {
+  if (tripLog.length) {
+    const ok = await inlineConfirm('Start a new trip? Unsaved progress will be cleared.');
+    if (!ok) return;
+  }
+  clearCurrentTrip();
+  activeTripId   = null;
+  activeTripName = null;
+  refreshSidebar();
+  appendLog('system', null, '🆕 New trip started. Where are you heading?');
+});
+
+// ─────────────────────────────────────────
+// CHAT SEND
+// ─────────────────────────────────────────
+
+async function handleSend() {
+  const query = inputEl.value.trim();
+  if (!query) return;
+  inputEl.value    = '';
+  sendBtn.disabled = true;
+  appendLog('user', 'You', query);
+
+  const thinkingEl = appendLog('assistant', 'Carte', '');
+  thinkingEl.querySelector('.msg-bubble').innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const reply  = await runAgent(query);
+    const bubble = thinkingEl.querySelector('.msg-bubble');
+    bubble.innerHTML   = '';
+    bubble.textContent = reply;
+  } catch (err) {
+    thinkingEl.querySelector('.msg-bubble').textContent = `Error: ${err.message}`;
+  }
+
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+sendBtn.addEventListener('click', handleSend);
+inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') handleSend(); });
+replayBtn.addEventListener('click', replayTrip);
+stopBtn.addEventListener('click', () => { replayAborted = true; });
+
+// ─────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────
+
+if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
+  navigator.serviceWorker.register('/sw.js').then(r => r.update()).catch(() => {});
+} else if (location.hostname === 'localhost') {
+  navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
+}
+
+startConversation();
+
+// Purge stale/corrupt IDB records on boot
+idbGetAll().then(all => {
+  all.filter(t => !t.updatedAt || !t.id || !Array.isArray(t.stops))
+     .forEach(t => idbDelete(t.id));
+}).catch(() => {});
+
+refreshSidebar();
+</script>
+</body>
+</html>
