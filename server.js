@@ -87,7 +87,7 @@ const server = http.createServer((req, res) => {
   // ── STATIC FILES ─────────────────────────────────────
   // Strip query strings so ?v=123 cache-busters still resolve
   const pathname = req.url.split("?")[0];
-  let filePath = pathname === "/" ? "/carte.html" : pathname;
+  let filePath = pathname === "/" ? "/carte_refactor.html" : pathname;
   filePath = path.join(__dirname, filePath);
   const ext = path.extname(filePath);
   // manifest.json must be served as application/manifest+json for PWA install
@@ -123,7 +123,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n  Carte server running`);
-  console.log(`  → http://localhost:${PORT}/carte.html\n`);
+  console.log(`  → http://localhost:${PORT}/carte_refactor.html\n`);
 
   if (ANTHROPIC_KEY === "YOUR_ANTHROPIC_API_KEY_HERE") {
     console.warn("  ⚠  Set your Anthropic API key via:");

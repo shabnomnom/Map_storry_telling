@@ -63,16 +63,24 @@
   </div>
 </div>
 
-<!-- Username prompt — shown on first visit if no ?u= in URL -->
-<div id="username-dialog">
-  <div id="username-box">
-    <div id="username-logo">Travel<em>Log</em></div>
-    <p id="username-tagline">Your travel log visualizer</p>
-    <label for="username-input">Choose a username to sync your trips across devices</label>
+<!-- Combined start dialog — shown on first visit (no ?u= in URL) -->
+<div id="start-dialog">
+  <div id="start-box">
+    <div id="start-logo">Car<em>te</em></div>
+    <p id="start-tagline">Your travel log visualizer</p>
+
+    <label for="username-input">What's your name?</label>
     <input id="username-input" type="text" placeholder="e.g. shabnam"
            maxlength="30" autocomplete="username" spellcheck="false" />
-    <p id="username-hint">Letters, numbers and hyphens only. This becomes part of your URL.</p>
-    <button id="username-go">Start exploring →</button>
+    <p id="username-hint">Letters, numbers and hyphens only — becomes part of your URL.</p>
+
+    <label for="journey-input">Where did your adventure begin?</label>
+    <input id="journey-input" type="text" placeholder="e.g. Paris, London, Tokyo…"
+           maxlength="80" autocomplete="off" spellcheck="false"
+           inputmode="text" enterkeyhint="go" />
+    <p id="journey-hint">We'll fly the globe there and start your story.</p>
+
+    <button id="start-go">Start my journey →</button>
   </div>
 </div>
 
@@ -136,8 +144,8 @@ const ANTHROPIC_PROXY = window.location.hostname === 'localhost'
   ? 'http://localhost:3000/api/claude'
   : '/api/claude';
 
-/** Default starting coordinate (New York City) — declared first, used everywhere */
-const ORIGIN = [-74.006, 40.7128];
+/** Default starting coordinate — overwritten at boot by the journey-start prompt */
+let ORIGIN = [-74.006, 40.7128]; // fallback: New York City
 
 /** Animation durations (ms) */
 const DURATIONS = {
@@ -303,9 +311,10 @@ const nameTripSaveBtn = document.getElementById('name-trip-save');
 const userBadge      = document.getElementById('user-badge');
 const userBadgeName  = document.getElementById('user-badge-name');
 const userBadgeCopy  = document.getElementById('user-badge-copy');
-const usernameDialog = document.getElementById('username-dialog');
+const startDialog    = document.getElementById('start-dialog');
 const usernameInput  = document.getElementById('username-input');
-const usernameGo     = document.getElementById('username-go');
+const journeyInputEl = document.getElementById('journey-input');
+const startGo        = document.getElementById('start-go');
 
 // ─────────────────────────────────────────
 // USERNAME & FIREBASE INIT
@@ -372,26 +381,20 @@ function applyUsername(name) {
   // Show badge
   userBadgeName.textContent = currentUser;
   userBadge.style.display = 'flex';
-  usernameDialog.classList.remove('open');
   refreshSidebar();
 }
 
-// Show username dialog if no ?u= in URL
+// Show start dialog if no ?u= in URL
 if (!currentUser) {
-  usernameDialog.classList.add('open');
+  startDialog.classList.add('open');
   setTimeout(() => usernameInput.focus(), 80);
 } else {
   userBadgeName.textContent = currentUser;
   userBadge.style.display = 'flex';
 }
 
-function handleUsernameGo() {
-  const val = sanitiseUser(usernameInput.value);
-  if (!val) { usernameInput.focus(); return; }
-  applyUsername(val);
-}
-usernameGo.addEventListener('click', handleUsernameGo);
-usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleUsernameGo(); });
+// The combined start dialog is wired up at the bottom of the file
+// (after map + ORIGIN are available for the geocode flyTo).
 
 // Copy personal URL to clipboard
 userBadgeCopy.addEventListener('click', () => {
@@ -1462,10 +1465,11 @@ async function runAgent(userMessage) {
 // ─────────────────────────────────────────
 const FALLBACK_GREETING = "Where in the world have you been? Tell me everything ✈️";
 
-async function startConversation() {
+async function startConversation(homeCity) {
+  const cityLine = homeCity ? ` Their journey starts in ${homeCity}.` : '';
   conversationHistory.push({
     role: 'user',
-    content: '[SYSTEM] The user just opened the app. Greet them warmly and ask where their travels have taken them. One or two sentences max.'
+    content: `[SYSTEM] The user just opened the app.${cityLine} Greet them warmly, mention their starting city if you know it, and ask where their travels have taken them. One or two sentences max.`
   });
 
   try {
@@ -1741,7 +1745,82 @@ if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
     .then(regs => regs.forEach(r => r.unregister()));
 }
 
-startConversation();
+// ─────────────────────────────────────────
+// COMBINED START DIALOG  (username + home city)
+// ─────────────────────────────────────────
+
+async function handleStartGo() {
+  const userVal = sanitiseUser(usernameInput.value);
+  const cityVal = journeyInputEl.value.trim();
+
+  // Validate username first
+  if (!userVal) { usernameInput.focus(); usernameInput.classList.add('input-error'); return; }
+  usernameInput.classList.remove('input-error');
+  // City is required too
+  if (!cityVal) { journeyInputEl.focus(); journeyInputEl.classList.add('input-error'); return; }
+  journeyInputEl.classList.remove('input-error');
+
+  startGo.disabled    = true;
+  startGo.textContent = 'Finding…';
+
+  try {
+    const geoUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(cityVal)}.json?access_token=${MAPBOX_TOKEN}&limit=1`;
+    const data   = await fetch(geoUrl).then(r => r.json());
+    const feat   = data.features?.[0];
+    if (!feat) {
+      // City not found — shake the input and let them retry
+      startGo.disabled    = false;
+      startGo.textContent = 'Start my journey →';
+      journeyInputEl.placeholder = 'Place not found — try again';
+      journeyInputEl.value = '';
+      journeyInputEl.focus();
+      return;
+    }
+
+    // ── Apply username ──
+    applyUsername(userVal);
+
+    // ── Update globe origin ──
+    ORIGIN[0] = feat.center[0];
+    ORIGIN[1] = feat.center[1];
+    if (map.getSource('route')) {
+      map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+    }
+    routeCoords.length = 0;
+    routeCoords.push(ORIGIN.slice());
+
+    const cityName = feat.place_name.split(',')[0].trim();
+
+    // ── Dismiss dialog, fly globe, start conversation ──
+    startDialog.classList.remove('open');
+    map.flyTo({ center: ORIGIN, zoom: 10, pitch: 40, bearing: 0, duration: 2500, essential: true });
+    startConversation(cityName);
+
+  } catch (_) {
+    // Network error — still apply username, fall back to NYC
+    applyUsername(userVal);
+    startDialog.classList.remove('open');
+    startConversation(null);
+  }
+}
+
+startGo.addEventListener('click', handleStartGo);
+// Tab from username → city field on Enter, submit from city field on Enter
+usernameInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); journeyInputEl.focus(); }
+});
+journeyInputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter') handleStartGo();
+});
+
+// Returning user (?u= already in URL) — show start dialog so they can pick a home city
+// (username field will be pre-filled and read-only for clarity)
+if (currentUser) {
+  usernameInput.value    = currentUser;
+  usernameInput.readOnly = true;
+  startDialog.classList.add('open');
+  setTimeout(() => journeyInputEl.focus(), 80);
+}
 
 // On boot: purge any IDB records that are stale/corrupt (no updatedAt or
 // mismatched user) so they don't pollute the sidebar via the IDB fallback.

@@ -62,16 +62,25 @@
   </div>
 </div>
 
-<!-- Username prompt -->
-<div id="username-dialog">
-  <div id="username-box">
-    <div id="username-logo">Travel<em>log</em></div>
-    <p id="username-tagline">Your travel log visualizer</p>
-    <label for="username-input">Choose a username to sync your trips across devices</label>
+<!-- Combined start dialog — username + home city in one step -->
+<div id="start-dialog">
+  <div id="start-box">
+    <div id="start-logo">Car<em>te</em></div>
+    <p id="start-tagline">Your travel log visualizer</p>
+
+    <label for="username-input">What's your name?</label>
     <input id="username-input" type="text" placeholder="e.g. shabnam"
            maxlength="30" autocomplete="username" spellcheck="false" />
-    <p id="username-hint">Letters, numbers and hyphens only. This becomes part of your URL.</p>
-    <button id="username-go">Start exploring →</button>
+    <p id="username-hint">Letters, numbers and hyphens only — becomes part of your URL.</p>
+
+    <label for="journey-input">Where did your adventure begin?</label>
+    <input id="journey-input" type="text" placeholder="e.g. Paris, London, Tokyo…"
+           maxlength="80" autocomplete="off" spellcheck="false"
+           inputmode="text" enterkeyhint="go" />
+    <p id="journey-hint">We'll fly the globe there and start your story.</p>
+
+    <button id="start-go">Start my journey →</button>
+    <p id="start-reset-hint">Returning user? <button id="start-reset-btn">Change your home city</button></p>
   </div>
 </div>
 
@@ -137,7 +146,7 @@ const ANTHROPIC_PROXY  = location.hostname === 'localhost'
   ? 'http://localhost:3000/api/claude'
   : '/api/claude';
 
-const ORIGIN = [-74.006, 40.7128]; // New York City
+let ORIGIN = [-74.006, 40.7128]; // mutable — overwritten by handleStartGo
 
 const DURATIONS = {
   fly:          4000,
@@ -290,15 +299,23 @@ const nameTripSaveBtn  = document.getElementById('name-trip-save');
 const userBadge        = document.getElementById('user-badge');
 const userBadgeName    = document.getElementById('user-badge-name');
 const userBadgeCopy    = document.getElementById('user-badge-copy');
-const usernameDialog   = document.getElementById('username-dialog');
+const startDialog      = document.getElementById('start-dialog');
 const usernameInput    = document.getElementById('username-input');
-const usernameGo       = document.getElementById('username-go');
+const journeyInputEl   = document.getElementById('journey-input');
+const startGo          = document.getElementById('start-go');
 
 // ─────────────────────────────────────────
 // USERNAME
 // ─────────────────────────────────────────
 
 let currentUser = new URLSearchParams(location.search).get('u')?.trim().toLowerCase() || null;
+
+// ── Origin prefs — persisted per-user in localStorage ──────────────────────
+// Key: `carte:origin:<username>`  Value: JSON { cityName, coords: [lng, lat] }
+const _originKey  = u => `carte:origin:${u}`;
+const loadOriginPrefs  = u => { try { return JSON.parse(localStorage.getItem(_originKey(u))); } catch { return null; } };
+const saveOriginPrefs  = (u, cityName, coords) => localStorage.setItem(_originKey(u), JSON.stringify({ cityName, coords }));
+const clearOriginPrefs = u => localStorage.removeItem(_originKey(u));
 
 // ── In-memory trip cache — declared early so waitForFirebase can reference it ──
 const _tripCache   = new Map();
@@ -313,27 +330,33 @@ function applyUsername(name) {
   history.replaceState({}, '', url.toString());
   userBadgeName.textContent = currentUser;
   userBadge.style.display   = 'flex';
-  usernameDialog.classList.remove('open');
   // Clear cache so we load THIS user's trips fresh from Firestore
   _tripCache.clear();
   refreshSidebar();
 }
 
+// Show start dialog on every fresh load so user can set home city
 if (!currentUser) {
-  usernameDialog.classList.add('open');
+  // Brand-new visitor — show full dialog
+  startDialog.classList.add('open');
   setTimeout(() => usernameInput.focus(), 80);
 } else {
-  userBadgeName.textContent = currentUser;
-  userBadge.style.display   = 'flex';
+  const savedOrigin = loadOriginPrefs(currentUser);
+  if (savedOrigin) {
+    // Returning user with saved origin — skip dialog entirely
+    userBadgeName.textContent = currentUser;
+    userBadge.style.display   = 'flex';
+    // Will be applied after map loads (see bootWithSavedOrigin call in BOOT section)
+  } else {
+    // Returning user but no saved origin — pre-fill username, ask for city only
+    userBadgeName.textContent = currentUser;
+    userBadge.style.display   = 'flex';
+    usernameInput.value    = currentUser;
+    usernameInput.readOnly = true;
+    startDialog.classList.add('open');
+    setTimeout(() => journeyInputEl.focus(), 80);
+  }
 }
-
-function handleUsernameGo() {
-  const val = sanitiseUser(usernameInput.value);
-  if (val) applyUsername(val);
-  else usernameInput.focus();
-}
-usernameGo.addEventListener('click', handleUsernameGo);
-usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleUsernameGo(); });
 
 userBadgeCopy.addEventListener('click', () => {
   const url = new URL(location.href);
@@ -494,12 +517,15 @@ async function persistTrip(name, existingId = null) {
   let createdAt = now;
   if (existingId) {
     const cached = _tripCache.get(id);
-    createdAt = cached?.createdAt
-      ?? (await withIDB('readonly', s => s.get(id)).catch(() => null))?.createdAt
-      ?? now;
+    if (cached?.createdAt) {
+      createdAt = cached.createdAt;
+    } else {
+      const old = await withIDB('readonly', s => s.get(id)).catch(() => null);
+      if (old?.createdAt) createdAt = old.createdAt;
+    }
   }
 
-  const record = { id, name, createdAt, updatedAt: now, stops, thumb };
+  const record = { id, user_id: currentUser, name, createdAt, updatedAt: now, stops, thumb };
   _cacheSet(record);
   Promise.all([idbPut(record), fbUpsert(record)]).catch(() => {});
   return record;
@@ -510,7 +536,10 @@ async function loadAllTrips() {
 
   let trips = await fbLoadAll();
   if (!trips) {
-    trips = (await idbGetAll()).sort((a, b) => b.updatedAt - a.updatedAt);
+    const all = await idbGetAll();
+    trips = all
+      .filter(t => t.user_id === currentUser)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
   } else {
     trips.forEach(t => idbPut(t).catch(() => {}));
   }
@@ -606,7 +635,7 @@ class MapPhotoFan {
     if (this.photos.length >= 5) this._addBtn.style.display = 'none';
   }
 
-  _addPhoto(dataUrl) {
+  _addPhoto(dataUrl, { silent = false } = {}) {
     if (this.photos.length >= 5) return;
     const idx  = this.photos.length;
     const wrap = document.createElement('div');
@@ -632,6 +661,7 @@ class MapPhotoFan {
       this.photos.splice(i, 1);
       this._relayout();
       if (this.photos.length < 5) this._addBtn.style.display = '';
+      autoSave(); // persist photo removal
     });
 
     wrap.appendChild(img);
@@ -640,7 +670,7 @@ class MapPhotoFan {
     this.photos.push({ dataUrl, wrap, img });
     this._relayout();
     if (this.photos.length >= 5) this._addBtn.style.display = 'none';
-    autoSave();
+    if (!silent) autoSave();
   }
 
   _relayout() {
@@ -939,8 +969,9 @@ async function runAgent(userMessage) {
 
 const FALLBACK_GREETING = "Where in the world have you been? Tell me everything ✈️";
 
-async function startConversation() {
-  pushHistory('user', '[SYSTEM] The user just opened the app. Greet them warmly and ask where their travels have taken them. One or two sentences max.');
+async function startConversation(homeCity = null) {
+  const cityLine = homeCity ? ` Their journey starts in ${homeCity}.` : '';
+  pushHistory('user', `[SYSTEM] The user just opened the app.${cityLine} Greet them warmly and ask where their travels have taken them. One or two sentences max.`);
   try {
     const data     = await callClaude(CLAUDE_MAX_TOKENS_GREETING, conversationHistory);
     const greeting = data.content.filter(b => b.type === 'text').map(b => b.text).join('') || FALLBACK_GREETING;
@@ -979,7 +1010,7 @@ function buildHudDots(activeIdx) {
 }
 
 async function replayTrip() {
-  if (tripLog.length < 2) return;
+  if (tripLog.length < 1) return;
   replayAborted = false;
 
   replayBtn.disabled  = true;
@@ -995,7 +1026,7 @@ async function replayTrip() {
   tripLog.forEach(s => s.fan?.hide());
   currentMarker = null;
 
-  map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+  map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN.slice()] } });
   map.flyTo({ center: ORIGIN, zoom: 3, pitch: 20, bearing: 0, duration: DURATIONS.flyOverview });
   await sleep(DURATIONS.overviewWait);
 
@@ -1211,7 +1242,7 @@ async function loadTripFromRecord(record) {
     allCoords.push(stop.coords);
 
     const fan = new MapPhotoFan(stop.coords, map);
-    (stop.photos ?? []).forEach(url => fan._addPhoto(url));
+    (stop.photos ?? []).forEach(url => fan._addPhoto(url, { silent: true }));
     logEntry.fan  = fan;
     currentMarker = fan;
   }
@@ -1329,11 +1360,111 @@ if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
   navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
 }
 
-startConversation();
+// ─────────────────────────────────────────
+// COMBINED START DIALOG  (username + home city)
+// ─────────────────────────────────────────
 
-// Purge stale/corrupt IDB records on boot
+async function handleStartGo() {
+  const userVal = sanitiseUser(usernameInput.value);
+  const cityVal = journeyInputEl.value.trim();
+
+  if (!userVal) { usernameInput.focus(); usernameInput.classList.add('input-error'); return; }
+  usernameInput.classList.remove('input-error');
+  if (!cityVal) { journeyInputEl.focus(); journeyInputEl.classList.add('input-error'); return; }
+  journeyInputEl.classList.remove('input-error');
+
+  startGo.disabled    = true;
+  startGo.textContent = 'Finding…';
+
+  try {
+    const geoUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(cityVal)}.json?access_token=${MAPBOX_TOKEN}&limit=1`;
+    const data   = await fetch(geoUrl).then(r => r.json());
+    const feat   = data.features?.[0];
+
+    if (!feat) {
+      startGo.disabled    = false;
+      startGo.textContent = 'Start my journey →';
+      journeyInputEl.placeholder = 'Place not found — try again';
+      journeyInputEl.value = '';
+      journeyInputEl.focus();
+      return;
+    }
+
+    applyUsername(userVal);
+
+    // Update globe origin
+    ORIGIN = [feat.center[0], feat.center[1]];
+    routeCoords.length = 0;
+    routeCoords.push(ORIGIN.slice());
+    if (map.getSource('route')) {
+      map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+    }
+
+    const cityName = feat.place_name.split(',')[0].trim();
+
+    // Persist so next visit skips this dialog
+    saveOriginPrefs(currentUser, cityName, ORIGIN.slice());
+
+    startDialog.classList.remove('open');
+    map.flyTo({ center: ORIGIN, zoom: 10, pitch: 40, bearing: 0, duration: 2500, essential: true });
+    startConversation(cityName);
+
+  } catch (_) {
+    applyUsername(userVal);
+    startDialog.classList.remove('open');
+    startConversation(null);
+  }
+}
+
+startGo.addEventListener('click', handleStartGo);
+usernameInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); journeyInputEl.focus(); }
+});
+journeyInputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter') handleStartGo();
+});
+
+// "Change your home city" — clears saved prefs and re-shows the dialog
+document.getElementById('start-reset-btn').addEventListener('click', () => {
+  if (currentUser) clearOriginPrefs(currentUser);
+  usernameInput.value    = currentUser ?? '';
+  usernameInput.readOnly = !!currentUser;
+  journeyInputEl.value   = '';
+  startGo.disabled       = false;
+  startGo.textContent    = 'Start my journey →';
+  startDialog.classList.add('open');
+  setTimeout(() => journeyInputEl.focus(), 80);
+});
+
+/**
+ * Called on boot when a returning user already has a saved origin.
+ * Waits for the map 'load' event (or fires immediately if already loaded),
+ * then restores ORIGIN, updates the route source, flies there, and starts
+ * the conversation — all without showing any dialog.
+ */
+function bootWithSavedOrigin(prefs) {
+  function go() {
+    ORIGIN = prefs.coords.slice();
+    routeCoords.length = 0;
+    routeCoords.push(ORIGIN.slice());
+    if (map.getSource('route')) {
+      map.getSource('route').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [ORIGIN] } });
+    }
+    map.flyTo({ center: ORIGIN, zoom: 10, pitch: 40, bearing: 0, duration: 2500, essential: true });
+    startConversation(prefs.cityName);
+  }
+  // Map may not be loaded yet at script-parse time
+  if (map.loaded()) { go(); } else { map.once('load', go); }
+}
+
+// If returning user has saved prefs, boot silently
+if (currentUser && loadOriginPrefs(currentUser)) {
+  bootWithSavedOrigin(loadOriginPrefs(currentUser));
+}
+
+// Purge stale/corrupt IDB records on boot, and any that belong to a different user
 idbGetAll().then(all => {
-  all.filter(t => !t.updatedAt || !t.id || !Array.isArray(t.stops))
+  all.filter(t => !t.updatedAt || !t.id || !Array.isArray(t.stops) || (currentUser && t.user_id && t.user_id !== currentUser))
      .forEach(t => idbDelete(t.id));
 }).catch(() => {});
 
